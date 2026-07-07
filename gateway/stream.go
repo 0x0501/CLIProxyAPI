@@ -1,16 +1,16 @@
 package gateway
 
 import (
-	"bytes"
 	"io"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-// PipeStream forwards upstream SSE chunks verbatim (re-appending the one newline
-// the executor stripped), and after the upstream stream ends appends exactly one
+// PipeStream forwards upstream SSE chunks framed per the given FormatProfile
+// (verbatim for already-framed formats like codex, "data: "-prefixed for raw-JSON
+// formats like openai), and after the upstream stream ends appends exactly one
 // control frame: tokenswim.usage on success, tokenswim.error on a mid-stream error.
-func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.StreamChunk, p Provider, model string) {
+func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.StreamChunk, profile FormatProfile, model string) {
 	for chunk := range chunks {
 		if chunk.Err != nil {
 			// chunk.Err may carry a StatusError (e.g. mid-stream usage-limit -> 429);
@@ -22,25 +22,25 @@ func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.Stream
 			flush()
 			return
 		}
-		// The completed frame carries usage; forward it, then append our summary.
-		if p.IsCompleted(sseData(chunk.Payload)) {
-			_, _ = w.Write(chunk.Payload)
+		raw := profile.Extract(chunk.Payload)
+		framed := profile.Frame(chunk.Payload)
+		// The terminal frame carries usage; forward it, then append our summary.
+		if profile.IsTerminal(raw) {
+			_, _ = w.Write(framed)
 			// "\n\n" (not "\n") closes this SSE event before the tokenswim.usage
 			// control frame, matching the worker's "\n\n"-delimited event split.
 			_, _ = w.Write([]byte("\n\n"))
-			if d, ok := p.ParseUsage(sseData(chunk.Payload)); ok {
+			if profile.AppendDone {
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}
+			if d, ok := profile.ParseUsage(raw); ok {
 				_, _ = w.Write(FormatUsageEvent(UsageFromDetail(d, model)))
 			}
 			flush()
 			continue
 		}
-		_, _ = w.Write(chunk.Payload)
+		_, _ = w.Write(framed)
 		_, _ = w.Write([]byte("\n"))
 		flush()
 	}
-}
-
-// sseData strips a leading "data: " so provider predicates/parsers see raw JSON.
-func sseData(line []byte) []byte {
-	return bytes.TrimPrefix(line, []byte("data: "))
 }
