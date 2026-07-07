@@ -12,6 +12,7 @@ type Envelope struct {
 	Provider   string          `json:"provider"`
 	Credential map[string]any  `json:"credential"`
 	Request    json.RawMessage `json:"request"`
+	Format     string          `json:"format"`
 }
 
 func DecodeEnvelope(r io.Reader) (Envelope, error) {
@@ -27,6 +28,9 @@ func DecodeEnvelope(r io.Reader) (Envelope, error) {
 	}
 	if len(env.Request) == 0 {
 		return Envelope{}, errors.New("envelope: missing request")
+	}
+	if env.Format == "" {
+		env.Format = "codex"
 	}
 	return env, nil
 }
