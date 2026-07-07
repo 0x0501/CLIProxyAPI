@@ -27,6 +27,49 @@ func TestClassify403DeactivatedIsRevoked(t *testing.T) {
 	}
 }
 
+func TestClassify2xxIsOK(t *testing.T) {
+	for _, status := range []int{200, 204} {
+		if got := Classify(status, ""); got != DispositionOK {
+			t.Fatalf("status %d: got %s want %s", status, got, DispositionOK)
+		}
+	}
+}
+
+func TestClassifyOther4xxIsTransientNotInvalid(t *testing.T) {
+	for _, status := range []int{400, 404} {
+		if got := Classify(status, ""); got != DispositionUpstreamError {
+			t.Fatalf("status %d: got %s want %s (must not be credential-fatal)", status, got, DispositionUpstreamError)
+		}
+	}
+}
+
+func TestClassify402IsInvalid(t *testing.T) {
+	if got := Classify(402, ""); got != DispositionInvalid {
+		t.Fatalf("got %s want %s", got, DispositionInvalid)
+	}
+}
+
+func TestHTTPStatusDispatchesOnDisposition(t *testing.T) {
+	cases := map[Disposition]int{
+		DispositionRevoked:       403,
+		DispositionInvalid:       401,
+		DispositionRateLimited:   429,
+		DispositionUpstreamError: 502,
+	}
+	for d, want := range cases {
+		if got := (ErrorPayload{Disposition: d}).HTTPStatus(); got != want {
+			t.Fatalf("disposition %s: got %d want %d", d, got, want)
+		}
+	}
+
+	// Headline dead-grant scenario: refresh failure carries no UpstreamStatus,
+	// so HTTPStatus must switch on Disposition, not UpstreamStatus.
+	dead := ClassifyRefreshError(errors.New(`token refresh failed with status 400: {"error":"invalid_grant"}`))
+	if got := dead.HTTPStatus(); got != 403 {
+		t.Fatalf("dead grant: got %d want 403 (payload=%+v)", got, dead)
+	}
+}
+
 func TestFormatErrorEvent(t *testing.T) {
 	got := FormatErrorEvent(ErrorPayload{Disposition: DispositionRevoked, UpstreamStatus: 403, Code: "account_deactivated", Message: "banned"})
 	if !bytes.HasPrefix(got, []byte("event: tokenswim.error\n")) || !bytes.HasSuffix(got, []byte("\n\n")) {
@@ -54,6 +97,13 @@ func TestStatusFromExecErrReadsStatusError(t *testing.T) {
 	// A plain error carries no status.
 	if s, _ := StatusFromExecErr(errors.New("boom")); s != 0 {
 		t.Fatalf("plain error must yield status 0, got %d", s)
+	}
+}
+
+func TestStatusFromExecErrPreservesMessageForNonStatusError(t *testing.T) {
+	status, msg := StatusFromExecErr(errors.New("network boom"))
+	if status != 0 || msg != "network boom" {
+		t.Fatalf("got status=%d msg=%q, want status=0 msg=%q", status, msg, "network boom")
 	}
 }
 

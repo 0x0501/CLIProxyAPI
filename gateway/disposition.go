@@ -3,16 +3,13 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-// Disposition is the final classification of an error (or success).
 type Disposition string
 
 const (
@@ -24,141 +21,100 @@ const (
 	DispositionUpstreamError Disposition = "upstream_error"
 )
 
-// ErrorPayload is the structured error report sent to the client.
 type ErrorPayload struct {
-	Disposition    Disposition
-	UpstreamStatus int
-	Code           string
-	Message        string
+	Disposition    Disposition `json:"disposition"`
+	UpstreamStatus int         `json:"upstream_status"`
+	Code           string      `json:"code"`
+	Message        string      `json:"message"`
 }
 
-// Classify maps an HTTP status and upstream body to a Disposition.
-// 401 → invalid (malformed token).
-// 403 → revoked (unless code is another error, then map accordingly).
-// 429 → rate_limited (transient).
-// 5xx → upstream_error (transient).
-// 400 (default for unknown 4xx) → invalid unless body says otherwise.
-func Classify(status int, body string) Disposition {
-	switch status {
-	case 401:
+// Classify maps an upstream HTTP status to a disposition. Credential-fatal
+// statuses (401/402/403) map to invalid/revoked; 429 and 5xx are transient and
+// MUST NOT mutate auth status downstream. Codex remaps capacity/usage-limit
+// bodies to 429 before we see them, so 429 is always treated as transient.
+func Classify(status int, _ string) Disposition {
+	switch {
+	case status == 401 || status == 402:
 		return DispositionInvalid
-	case 403:
-		// Extract code from body to see if it's account_deactivated (revoked) or something else.
-		code := gjson.Get(body, "error.code").String()
-		if code == "account_deactivated" {
-			return DispositionRevoked
-		}
-		return DispositionRevoked // 403 defaults to revoked
-	case 429:
+	case status == 403:
+		return DispositionRevoked
+	case status == 429:
 		return DispositionRateLimited
-	case 500, 502, 503, 504:
+	case status >= 500:
 		return DispositionUpstreamError
+	case status >= 200 && status < 300:
+		return DispositionOK
 	default:
-		// Treat other 4xx as invalid (malformed request or token).
-		if status >= 400 && status < 500 {
-			return DispositionInvalid
-		}
-		// Treat other 5xx as upstream_error.
-		if status >= 500 {
-			return DispositionUpstreamError
-		}
-		// Default: unknown error.
+		// Other 4xx (e.g. 400 bad request) are client/payload errors, not
+		// credential problems — transient, status untouched.
 		return DispositionUpstreamError
 	}
 }
 
-// StatusFromExecErr extracts the HTTP status and body from an executor error.
-// Executor errors implement cliproxyexecutor.StatusError (status code + Error() body).
-// If the error is not a StatusError, returns (0, "").
+// StatusFromExecErr pulls the upstream HTTP status + raw body out of an executor
+// error. CLIProxy wraps upstream failures in a value implementing the exported
+// cliproxyexecutor.StatusError interface; err.Error() is the upstream body.
+// Returns status 0 when no status is carried (e.g. a scanner error).
 func StatusFromExecErr(err error) (int, string) {
-	var se executor.StatusError
-	if errors.As(err, &se) {
-		return se.StatusCode(), se.Error()
+	if err == nil {
+		return 0, ""
 	}
-	return 0, ""
+	var se cliproxyexecutor.StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode(), err.Error()
+	}
+	return 0, err.Error()
 }
 
-// ClassifyExecError classifies an error from ExecuteStream or chunk.Err.
-// It extracts the status and body, parses the error code from the body,
-// and returns the full ErrorPayload.
 func ClassifyExecError(err error) ErrorPayload {
 	status, body := StatusFromExecErr(err)
-	disposition := Classify(status, body)
-
-	code := gjson.Get(body, "error.code").String()
-	message := gjson.Get(body, "error.message").String()
-
 	return ErrorPayload{
-		Disposition:    disposition,
+		Disposition:    Classify(status, body),
 		UpstreamStatus: status,
-		Code:           code,
-		Message:        message,
+		Code:           gjson.Get(body, "error.code").String(),
+		Message:        truncate(body, 2000),
 	}
 }
 
-// ClassifyRefreshError classifies a failed token refresh.
-// The refresh path returns a string-only error (no typed status):
-// a permanent refusal (invalid_grant / HTTP 400 / 401) means the grant is dead -> revoked;
-// anything else is transient -> upstream_error.
+// ClassifyRefreshError classifies a failed token refresh. The refresh path
+// returns a string-only error (no typed status): a permanent refusal
+// (invalid_grant / refresh_token_reused / HTTP 400 / 401) means the grant is dead
+// -> revoked; anything else is transient -> upstream_error (status untouched).
 func ClassifyRefreshError(err error) ErrorPayload {
-	errStr := err.Error()
-
-	// Scan for permanent failure markers.
-	if strings.Contains(errStr, "invalid_grant") ||
-		strings.Contains(errStr, "refresh_token_reused") ||
-		strings.Contains(errStr, "status 400") ||
-		strings.Contains(errStr, "status 401") {
-		return ErrorPayload{
-			Disposition:    DispositionRevoked,
-			UpstreamStatus: 0, // No typed status from refresh.
-			Code:           "refresh_failed",
-			Message:        errStr,
-		}
+	s := strings.ToLower(err.Error())
+	permanent := strings.Contains(s, "invalid_grant") ||
+		strings.Contains(s, "refresh_token_reused") ||
+		strings.Contains(s, "status 400") ||
+		strings.Contains(s, "status 401")
+	d := DispositionUpstreamError
+	if permanent {
+		d = DispositionRevoked
 	}
-
-	// Extract any 5xx status mentioned in the error for display.
-	upstreamStatus := 0
-	statusRe := regexp.MustCompile(`status (\d{3})`)
-	if match := statusRe.FindStringSubmatch(errStr); len(match) > 1 {
-		if s, err := strconv.Atoi(match[1]); err == nil {
-			upstreamStatus = s
-		}
-	}
-
-	return ErrorPayload{
-		Disposition:    DispositionUpstreamError,
-		UpstreamStatus: upstreamStatus,
-		Code:           "refresh_failed",
-		Message:        errStr,
-	}
+	return ErrorPayload{Disposition: d, Code: "refresh_failed", Message: truncate(err.Error(), 2000)}
 }
 
-// FormatErrorEvent formats an ErrorPayload as an SSE frame.
 func FormatErrorEvent(p ErrorPayload) []byte {
-	// Assemble the JSON payload.
-	payload := map[string]interface{}{
-		"disposition":     p.Disposition,
-		"upstream_status": p.UpstreamStatus,
-		"code":            p.Code,
-		"message":         p.Message,
-	}
-	data, _ := json.Marshal(payload)
-
-	// SSE frame: event: <event>\ndata: <json>\n\n
-	return []byte(fmt.Sprintf("event: tokenswim.error\ndata: %s\n\n", data))
+	data, _ := json.Marshal(p)
+	out := append([]byte("event: tokenswim.error\ndata: "), data...)
+	return append(out, '\n', '\n')
 }
 
-// HTTPStatus returns the HTTP status to send before streaming.
-// If the upstream returned a sane status (401/403/429/5xx), return it.
-// Otherwise, default to 502 (bad gateway).
 func (p ErrorPayload) HTTPStatus() int {
-	switch p.UpstreamStatus {
-	case 401, 403, 429:
-		return p.UpstreamStatus
-	case 500, 502, 503, 504:
-		return p.UpstreamStatus
+	switch p.Disposition {
+	case DispositionInvalid, DispositionExpired:
+		return 401
+	case DispositionRevoked:
+		return 403
+	case DispositionRateLimited:
+		return 429
 	default:
-		// Unknown or no upstream status; default to 502.
 		return 502
 	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
