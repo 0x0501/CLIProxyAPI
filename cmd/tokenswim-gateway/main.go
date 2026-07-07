@@ -16,7 +16,8 @@ import (
 func main() {
 	logging.SetupBaseLogger()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/responses", gateway.Handler(&config.Config{}))
+	mux.HandleFunc("/invoke", gateway.Handler(&config.Config{}))
+	mux.HandleFunc("/models", gateway.ModelsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	addr := ":8787"
