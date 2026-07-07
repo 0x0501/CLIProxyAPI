@@ -22,6 +22,22 @@ func TestLookupFormatOpenAIFramesRawJSON(t *testing.T) {
 	}
 }
 
+func TestCodexProfileUsageBothNestings(t *testing.T) {
+	p := LookupFormat("openai-response")
+	// Streaming/codex shape: nested response.usage.
+	if d, ok := p.ParseUsage([]byte(`{"response":{"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); !ok || d.TotalTokens != 5 {
+		t.Fatalf("nested usage should parse: %+v ok=%v", d, ok)
+	}
+	// openai-response NON-STREAM shape: top-level usage (envelope unwrapped).
+	if d, ok := p.ParseUsage([]byte(`{"id":"resp_1","usage":{"input_tokens":4,"output_tokens":4,"total_tokens":8}}`)); !ok || d.TotalTokens != 8 {
+		t.Fatalf("top-level usage should parse: %+v ok=%v", d, ok)
+	}
+	// No usage anywhere → ok=false.
+	if _, ok := p.ParseUsage([]byte(`{"id":"resp_1"}`)); ok {
+		t.Fatal("payload without usage must return ok=false")
+	}
+}
+
 func TestLookupFormatCodexStyle(t *testing.T) {
 	for _, f := range []string{"codex", "openai-response", "unknown"} {
 		p := LookupFormat(f)

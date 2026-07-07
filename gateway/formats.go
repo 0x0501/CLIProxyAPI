@@ -24,13 +24,26 @@ type FormatProfile struct {
 
 func stripData(b []byte) []byte { return bytes.TrimPrefix(b, []byte("data: ")) }
 
+// codexUsage reads usage from a codex/responses payload, tolerating both the
+// nested `response.usage` shape (streaming frames, codex non-stream) and the
+// top-level `usage` shape (the openai-response non-stream translator unwraps
+// the envelope). Returns ok=false only when neither location has usage.
+func codexUsage(raw []byte) (usage.Detail, bool) {
+	if d, ok := helps.ParseCodexUsage(raw); ok {
+		return d, true
+	}
+	// Re-nest so a top-level `usage` resolves under `response.usage`.
+	wrapped := append(append([]byte(`{"response":`), raw...), '}')
+	return helps.ParseCodexUsage(wrapped)
+}
+
 // codexStyle: chunks are already "data: {...}"; terminal = response.completed;
 // usage from response.usage. Used for "codex" and "openai-response".
 var codexStyle = FormatProfile{
 	Extract:    stripData,
 	Frame:      func(b []byte) []byte { return b },
 	IsTerminal: func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "response.completed" },
-	ParseUsage: helps.ParseCodexUsage,
+	ParseUsage: codexUsage,
 	AppendDone: false,
 }
 
