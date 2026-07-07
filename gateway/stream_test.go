@@ -34,6 +34,9 @@ func TestPipeStreamForwardsAndAppendsUsage(t *testing.T) {
 	if !bytes.Contains(buf.Bytes(), []byte("event: tokenswim.usage")) || !bytes.Contains(buf.Bytes(), []byte(`"total_tokens":5`)) {
 		t.Fatalf("usage frame not appended: %s", out)
 	}
+	if !bytes.Contains(buf.Bytes(), []byte("\n\nevent: tokenswim.usage")) {
+		t.Fatalf("completed frame not closed with blank line before usage frame: %s", out)
+	}
 }
 
 func TestPipeStreamOnChunkErrorAppendsErrorFrame(t *testing.T) {
@@ -45,5 +48,8 @@ func TestPipeStreamOnChunkErrorAppendsErrorFrame(t *testing.T) {
 	), p, "m")
 	if !bytes.Contains(buf.Bytes(), []byte("event: tokenswim.error")) || !bytes.Contains(buf.Bytes(), []byte(`"disposition":"upstream_error"`)) {
 		t.Fatalf("error frame not appended: %s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("\n\nevent: tokenswim.error")) {
+		t.Fatalf("preceding forwarded frame not closed with blank line before error frame: %s", buf.String())
 	}
 }
