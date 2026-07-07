@@ -30,3 +30,15 @@ func TestHandlerRejectsUnknownProvider(t *testing.T) {
 		t.Fatalf("want 400 for unknown provider, got %d", rec.Code)
 	}
 }
+
+func TestHandlerStreamFlagFromRequest(t *testing.T) {
+	// A request with "stream": false must NOT be treated as SSE; this asserts the
+	// handler reads the flag (full behavior needs a live upstream — see e2e).
+	// We assert the pure helper the handler uses:
+	if requestWantsStream([]byte(`{"model":"m","stream":true}`)) != true {
+		t.Fatal("stream:true should be detected")
+	}
+	if requestWantsStream([]byte(`{"model":"m"}`)) != false {
+		t.Fatal("absent stream should default to non-streaming")
+	}
+}

@@ -7,7 +7,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
+
+// requestWantsStream reports whether the client request body asked for SSE streaming.
+func requestWantsStream(payload []byte) bool {
+	return gjson.GetBytes(payload, "stream").Bool()
+}
 
 func Handler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -48,16 +54,35 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 			Model string `json:"model"`
 		}
 		_ = json.Unmarshal(env.Request, &modelHint)
-		format := sdktranslator.FromString(env.Provider)
-		result, xerr := exec.ExecuteStream(r.Context(), auth, cliproxyexecutor.Request{
-			Model:   modelHint.Model,
-			Payload: env.Request,
-		}, cliproxyexecutor.Options{
-			Stream:          true,
+
+		profile := LookupFormat(env.Format)
+		format := sdktranslator.FromString(env.Format)
+		execReq := cliproxyexecutor.Request{Model: modelHint.Model, Payload: env.Request}
+		opts := cliproxyexecutor.Options{
+			Stream:          requestWantsStream(env.Request),
 			SourceFormat:    format,
 			ResponseFormat:  format,
 			OriginalRequest: env.Request,
-		})
+		}
+
+		if !opts.Stream {
+			resp, xerr := exec.Execute(r.Context(), auth, execReq, opts)
+			if xerr != nil {
+				writePreStreamError(w, ClassifyExecError(xerr))
+				return
+			}
+			if d, ok := profile.ParseUsage(resp.Payload); ok {
+				if b, err := json.Marshal(UsageFromDetail(d, modelHint.Model)); err == nil {
+					w.Header().Set("X-Tokenswim-Usage", string(b))
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(resp.Payload)
+			return
+		}
+
+		result, xerr := exec.ExecuteStream(r.Context(), auth, execReq, opts)
 		if xerr != nil {
 			writePreStreamError(w, ClassifyExecError(xerr))
 			return
@@ -72,7 +97,7 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 				flusher.Flush()
 			}
 		}
-		PipeStream(w, flush, result.Chunks, provider, modelHint.Model)
+		PipeStream(w, flush, result.Chunks, profile, modelHint.Model)
 	}
 }
 
