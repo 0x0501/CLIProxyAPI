@@ -27,6 +27,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/invoke", gateway.Handler(cfg))
+	mux.HandleFunc("/usage", gateway.UsageHandler(cfg))
 	mux.HandleFunc("/models", gateway.ModelsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
