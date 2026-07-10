@@ -432,6 +432,124 @@ func TestXAIExecutorOmitsUnsupportedReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestXAISupportsReasoningEffortUsesModelRegistry(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		want  bool
+	}{
+		{name: "grok-4.5", model: "grok-4.5", want: true},
+		{name: "grok-4.5 with suffix", model: "grok-4.5(high)", want: true},
+		{name: "grok-4.3", model: "grok-4.3", want: true},
+		{name: "grok-3-mini", model: "grok-3-mini", want: true},
+		{name: "grok-3-mini-fast", model: "grok-3-mini-fast", want: true},
+		{name: "grok-4.20-multi-agent", model: "grok-4.20-multi-agent-0309", want: true},
+		{name: "provider-prefixed grok-4.5", model: "xai/grok-4.5", want: true},
+		{name: "legacy grok-4", model: "grok-4", want: false},
+		{name: "composer without thinking metadata", model: "grok-composer-2.5-fast", want: false},
+		{name: "non-reasoning 4.20", model: "grok-4.20-0309-non-reasoning", want: false},
+		{name: "unknown model", model: "unknown-xai-model", want: false},
+		{name: "empty model", model: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := xaiSupportsReasoningEffort(tt.model); got != tt.want {
+				t.Fatalf("xaiSupportsReasoningEffort(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorKeepsReasoningEffortForGrok45(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hello","reasoning":{"effort":"high"}}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "grok-4.5" {
+		t.Fatalf("model = %q, want grok-4.5; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high; body=%s", got, string(gotBody))
+	}
+}
+
+func TestXAIExecutorKeepsPayloadOverrideReasoningEffortForGrok45(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{{Name: "grok-4.5"}},
+					Params: map[string]any{"reasoning.effort": "high"},
+				},
+			},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high from payload.override; body=%s", got, string(gotBody))
+	}
+}
+
 func TestXAIExecutorAppliesThinkingSuffix(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -939,6 +1057,119 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 				t.Fatalf("path = %q, want %s", gotPath, tt.wantPath)
 			}
 		})
+	}
+}
+
+func TestNormalizeXAITools_SimplifiesCodexAppAutomationUpdateSchema(t *testing.T) {
+	// Large oneOf+$ref schema mimicking Codex Desktop codex_app.automation_update.
+	params := `{"oneOf":[{"type":"object","properties":{"mode":{"type":"string"}}}],"$defs":{"a":{"type":"string"}},"x":"` + strings.Repeat("y", 1600) + `"}`
+	body := []byte(`{"model":"grok-4.5","tools":[{"type":"namespace","name":"codex_app","tools":[{"type":"function","name":"automation_update","description":"sched","strict":true,"parameters":` + params + `}]},{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`)
+	out := normalizeXAITools(body)
+
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools missing: %s", string(out))
+	}
+	foundAuto := false
+	foundExec := false
+	for _, tool := range tools.Array() {
+		switch tool.Get("name").String() {
+		case "automation_update":
+			foundAuto = true
+			paramsRaw := tool.Get("parameters").Raw
+			if strings.Contains(paramsRaw, `"oneOf"`) || strings.Contains(paramsRaw, `"$defs"`) {
+				t.Fatalf("automation_update parameters were not simplified: %s", paramsRaw)
+			}
+			if tool.Get("parameters.type").String() != "object" {
+				t.Fatalf("automation_update parameters.type = %q, want object", tool.Get("parameters.type").String())
+			}
+			if tool.Get("parameters.additionalProperties").Type != gjson.True {
+				t.Fatalf("automation_update parameters should allow additionalProperties: %s", paramsRaw)
+			}
+			if tool.Get("strict").Type != gjson.False {
+				t.Fatalf("automation_update strict = %s, want false", tool.Get("strict").Raw)
+			}
+		case "exec_command":
+			foundExec = true
+			if got := tool.Get("parameters.properties.cmd.type").String(); got != "string" {
+				t.Fatalf("exec_command schema should be preserved, got %q in %s", got, tool.Raw)
+			}
+		}
+	}
+	if !foundAuto {
+		t.Fatalf("automation_update tool missing after normalize: %s", string(out))
+	}
+	if !foundExec {
+		t.Fatalf("exec_command tool missing after normalize: %s", string(out))
+	}
+}
+
+func TestNormalizeXAITools_PreservesUnrelatedSchemas(t *testing.T) {
+	largeParams := `{"oneOf":[{"type":"object","properties":{"mode":{"type":"string"}}}],"$defs":{"a":{"type":"string"}},"x":"` + strings.Repeat("y", 1600) + `"}`
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "top-level automation_update",
+			body: []byte(`{"tools":[{"type":"function","name":"automation_update","strict":true,"parameters":{"type":"object","properties":{"cron":{"type":"string"}},"required":["cron"],"additionalProperties":false}}]}`),
+		},
+		{
+			name: "automation_update in another namespace",
+			body: []byte(`{"tools":[{"type":"namespace","name":"calendar","tools":[{"type":"function","name":"automation_update","strict":true,"parameters":{"type":"object","properties":{"cron":{"type":"string"}},"required":["cron"],"additionalProperties":false}}]}]}`),
+		},
+		{
+			name: "custom automation_update in codex_app",
+			body: []byte(`{"tools":[{"type":"namespace","name":"codex_app","tools":[{"type":"custom","name":"automation_update","strict":true,"parameters":{"type":"object","properties":{"cron":{"type":"string"}},"required":["cron"],"additionalProperties":false}}]}]}`),
+		},
+		{
+			name: "large schema on another codex_app function",
+			body: []byte(`{"tools":[{"type":"namespace","name":"codex_app","tools":[{"type":"function","name":"exec_command","strict":true,"parameters":` + largeParams + `}]}]}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := normalizeXAITools(tt.body)
+			tool := gjson.GetBytes(out, "tools.0")
+			if tool.Get("strict").Type != gjson.True {
+				t.Fatalf("strict changed for unrelated tool: %s", string(out))
+			}
+			params := tool.Get("parameters")
+			if tt.name == "large schema on another codex_app function" {
+				if !params.Get("oneOf").Exists() || !params.Get("$defs").Exists() {
+					t.Fatalf("large schema was simplified: %s", string(out))
+				}
+				return
+			}
+			if got := params.Get("properties.cron.type").String(); got != "string" {
+				t.Fatalf("schema was simplified, cron type = %q: %s", got, string(out))
+			}
+			if params.Get("additionalProperties").Type != gjson.False {
+				t.Fatalf("additionalProperties changed: %s", string(out))
+			}
+		})
+	}
+}
+
+func TestXAIFunctionParametersNeedSimplification(t *testing.T) {
+	auto := gjson.Parse(`{"type":"function","name":"automation_update","parameters":{"type":"object"}}`)
+	if !xaiFunctionParametersNeedSimplification(auto, "codex_app") {
+		t.Fatal("codex_app.automation_update should need simplification")
+	}
+	if xaiFunctionParametersNeedSimplification(auto, "calendar") {
+		t.Fatal("automation_update outside codex_app should not need simplification")
+	}
+	if xaiFunctionParametersNeedSimplification(auto, "") {
+		t.Fatal("top-level automation_update should not need simplification")
+	}
+	custom := gjson.Parse(`{"type":"custom","name":"automation_update","parameters":{"type":"object"}}`)
+	if xaiFunctionParametersNeedSimplification(custom, "codex_app") {
+		t.Fatal("custom codex_app.automation_update should not need simplification")
+	}
+	safe := gjson.Parse(`{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}`)
+	if xaiFunctionParametersNeedSimplification(safe, "codex_app") {
+		t.Fatal("unrelated codex_app function should not need simplification")
 	}
 }
 
