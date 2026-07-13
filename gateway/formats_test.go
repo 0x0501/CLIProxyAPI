@@ -32,6 +32,12 @@ func TestCodexProfileUsageBothNestings(t *testing.T) {
 	if d, ok := p.ParseUsage([]byte(`{"id":"resp_1","usage":{"input_tokens":4,"output_tokens":4,"total_tokens":8}}`)); !ok || d.TotalTokens != 8 {
 		t.Fatalf("top-level usage should parse: %+v ok=%v", d, ok)
 	}
+	// Same shape WITH a top-level service_tier: the direct parse matches on the
+	// tier alone (ok=true, zero tokens) and must not shadow the real usage —
+	// else every non-stream request settles at zero cost.
+	if d, ok := p.ParseUsage([]byte(`{"id":"resp_1","service_tier":"default","usage":{"input_tokens":13,"output_tokens":19,"total_tokens":32}}`)); !ok || d.TotalTokens != 32 {
+		t.Fatalf("top-level usage with service_tier should parse: %+v ok=%v", d, ok)
+	}
 	// No usage anywhere → ok=false.
 	if _, ok := p.ParseUsage([]byte(`{"id":"resp_1"}`)); ok {
 		t.Fatal("payload without usage must return ok=false")

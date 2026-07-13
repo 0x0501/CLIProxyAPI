@@ -24,17 +24,28 @@ type FormatProfile struct {
 
 func stripData(b []byte) []byte { return bytes.TrimPrefix(b, []byte("data: ")) }
 
+func usageHasTokens(d usage.Detail) bool {
+	return d.InputTokens > 0 || d.OutputTokens > 0 || d.TotalTokens > 0
+}
+
 // codexUsage reads usage from a codex/responses payload, tolerating both the
 // nested `response.usage` shape (streaming frames, codex non-stream) and the
 // top-level `usage` shape (the openai-response non-stream translator unwraps
 // the envelope). Returns ok=false only when neither location has usage.
 func codexUsage(raw []byte) (usage.Detail, bool) {
-	if d, ok := helps.ParseCodexUsage(raw); ok {
+	direct, okDirect := helps.ParseCodexUsage(raw)
+	if okDirect && usageHasTokens(direct) {
+		return direct, true
+	}
+	// Re-nest so a top-level `usage` resolves under `response.usage`. Prefer this
+	// over a token-less direct hit: ParseCodexUsage returns ok=true on a
+	// service-tier-only match, which would otherwise shadow the real top-level
+	// usage and settle every non-stream request at zero tokens.
+	wrapped := append(append([]byte(`{"response":`), raw...), '}')
+	if d, ok := helps.ParseCodexUsage(wrapped); ok && usageHasTokens(d) {
 		return d, true
 	}
-	// Re-nest so a top-level `usage` resolves under `response.usage`.
-	wrapped := append(append([]byte(`{"response":`), raw...), '}')
-	return helps.ParseCodexUsage(wrapped)
+	return direct, okDirect
 }
 
 // codexStyle: chunks are already "data: {...}"; terminal = response.completed;
