@@ -19,6 +19,19 @@ func TestLookupCodexRegistered(t *testing.T) {
 	}
 }
 
+func TestLookupXAIRegistered(t *testing.T) {
+	p, ok := Lookup("xai")
+	if !ok {
+		t.Fatal("xai must be registered")
+	}
+	if p.NewExecutor == nil {
+		t.Fatal("xai provider must define executor factory")
+	}
+	if exec := p.NewExecutor(newTestConfig()); exec == nil {
+		t.Fatal("NewExecutor returned nil")
+	}
+}
+
 func TestLookupUnknownProvider(t *testing.T) {
 	if _, ok := Lookup("does-not-exist"); ok {
 		t.Fatal("unknown provider must not resolve")

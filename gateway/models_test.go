@@ -18,6 +18,7 @@ func TestModelsHandlerReturnsOpenAIList(t *testing.T) {
 		Data   []struct {
 			ID     string `json:"id"`
 			Object string `json:"object"`
+			Family string `json:"family"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -27,8 +28,17 @@ func TestModelsHandlerReturnsOpenAIList(t *testing.T) {
 		t.Fatalf("expected non-empty list, got %+v", body)
 	}
 	for _, m := range body.Data {
-		if m.ID == "" || m.Object != "model" {
+		if m.ID == "" || m.Object != "model" || m.Family == "" {
 			t.Fatalf("model must have id + object=model: %+v", m)
 		}
+		if m.ID == "grok-imagine-image" || m.ID == "grok-imagine-video" {
+			t.Fatalf("media model must not be in the text catalog: %+v", m)
+		}
 	}
+	for _, m := range body.Data {
+		if m.Family == "xai" {
+			return
+		}
+	}
+	t.Fatal("expected at least one xAI text model")
 }

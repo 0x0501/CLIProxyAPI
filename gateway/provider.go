@@ -19,6 +19,11 @@ var Registry = map[string]Provider{
 			return codexexec.NewCodexExecutor(cfg)
 		},
 	},
+	"xai": {
+		NewExecutor: func(cfg *config.Config) cliproxyauth.ProviderExecutor {
+			return codexexec.NewXAIExecutor(cfg)
+		},
+	},
 }
 
 func Lookup(name string) (Provider, bool) {
