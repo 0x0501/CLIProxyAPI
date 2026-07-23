@@ -71,10 +71,55 @@ var openaiStyle = FormatProfile{
 	AppendDone: true,
 }
 
+// extractClaudeEvent pulls the JSON for terminal/usage detection out of a claude
+// SSE chunk. The codex/openai->claude translators emit fully-framed multi-line
+// event:/data: events, and a single upstream chunk can bundle several (a codex
+// `response.completed` line becomes content_block_stop + message_delta +
+// message_stop in one chunk). So scan every data: line and PREFER the
+// message_delta event — the only frame the translator puts consolidated usage on
+// — falling back to the first data: payload for non-terminal chunks.
+func extractClaudeEvent(b []byte) []byte {
+	var first []byte
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		t := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(t, []byte("data:")) {
+			continue
+		}
+		j := bytes.TrimSpace(t[len("data:"):])
+		if len(j) == 0 || j[0] != '{' {
+			continue
+		}
+		if first == nil {
+			first = j
+		}
+		if gjson.GetBytes(j, "type").String() == "message_delta" {
+			return j
+		}
+	}
+	return first
+}
+
+// claudeStyle: the codex/openai->claude translators already emit fully-framed
+// event:/data: SSE, so Frame is identity. The translator consolidates all usage
+// (input+output+cache_read) onto a single message_delta frame — message_start
+// zeros it and message_stop carries none — so message_delta is the usage-bearing
+// terminal, read from top-level `usage`. Used for "claude".
+var claudeStyle = FormatProfile{
+	Extract:    extractClaudeEvent,
+	Frame:      func(b []byte) []byte { return b },
+	IsTerminal: func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "message_delta" },
+	ParseUsage: func(raw []byte) (usage.Detail, bool) {
+		d := helps.ParseClaudeUsage(raw)
+		return d, usageHasTokens(d)
+	},
+	AppendDone: false,
+}
+
 var formatProfiles = map[string]FormatProfile{
 	"codex":           codexStyle,
 	"openai-response": codexStyle,
 	"openai":          openaiStyle,
+	"claude":          claudeStyle,
 }
 
 // LookupFormat returns the profile for a format string, defaulting to codex-style.

@@ -51,6 +51,46 @@ func TestPipeStreamOpenAIFramesAndDone(t *testing.T) {
 	}
 }
 
+// TestPipeStreamClaudeForwardsVerbatimAndAppendsUsage is the streaming
+// billing-correctness gate: over a captured REAL codex->claude transcript (built
+// by codexClaudeChunks via the live translator), PipeStream must forward the
+// Anthropic events untouched — including the terminal chunk that bundles
+// content_block_stop + message_delta + message_stop — and append exactly one
+// tokenswim.usage frame carrying the tokens consolidated onto message_delta.
+func TestPipeStreamClaudeForwardsVerbatimAndAppendsUsage(t *testing.T) {
+	var buf bytes.Buffer
+	claudeChunks := codexClaudeChunks(t)
+	scs := make([]cliproxyexecutor.StreamChunk, 0, len(claudeChunks))
+	for _, c := range claudeChunks {
+		scs = append(scs, cliproxyexecutor.StreamChunk{Payload: c})
+	}
+	PipeStream(&buf, func() {}, feed(scs...), LookupFormat("claude"), "gpt-5")
+	out := buf.Bytes()
+
+	// Anthropic events forwarded verbatim (identity Frame).
+	for _, want := range []string{
+		"event: message_start",
+		`"text":"Hello"`,
+		"event: message_delta",
+		"event: message_stop",
+	} {
+		if !bytes.Contains(out, []byte(want)) {
+			t.Fatalf("claude event not forwarded verbatim: missing %q\n%s", want, out)
+		}
+	}
+	// Exactly one appended usage control frame, carrying the consolidated tokens.
+	if n := bytes.Count(out, []byte("event: tokenswim.usage")); n != 1 {
+		t.Fatalf("want exactly one tokenswim.usage frame, got %d\n%s", n, out)
+	}
+	if !bytes.Contains(out, []byte(`"input_tokens":8`)) ||
+		!bytes.Contains(out, []byte(`"output_tokens":7`)) {
+		t.Fatalf("usage frame missing consolidated tokens: %s", out)
+	}
+	if bytes.Contains(out, []byte("[DONE]")) {
+		t.Fatal("claude must NOT emit [DONE]")
+	}
+}
+
 func TestPipeStreamOnChunkErrorAppendsErrorFrame(t *testing.T) {
 	var buf bytes.Buffer
 	PipeStream(&buf, func() {}, feed(
