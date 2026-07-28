@@ -595,8 +595,11 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		usageNode,
 		"input_tokens_details.cache_creation_tokens",
 		"input_tokens_details.cache_write_tokens",
+		// Non-standard name the codex->chat-completions translator emits today.
+		"input_tokens_details.cached_creation_tokens",
 		"prompt_tokens_details.cache_creation_tokens",
 		"prompt_tokens_details.cache_write_tokens",
+		"prompt_tokens_details.cached_creation_tokens",
 	)
 	if cacheCreation.Exists() {
 		detail.CacheCreationTokens = cacheCreation.Int()

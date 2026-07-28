@@ -55,6 +55,11 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 		}
 		_ = json.Unmarshal(env.Request, &modelHint)
 
+		// The capture slot must be in the context the executor runs under: the
+		// usage plugin correlates raw upstream detail to this request by that
+		// context and nothing else (ADR 0019).
+		ctx, capture := NewUsageCapture(r.Context(), modelHint.Model)
+
 		profile := LookupFormat(env.Format)
 		format := sdktranslator.FromString(env.Format)
 		execReq := cliproxyexecutor.Request{Model: modelHint.Model, Payload: env.Request}
@@ -66,12 +71,13 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 		}
 
 		if !opts.Stream {
-			resp, xerr := exec.Execute(r.Context(), auth, execReq, opts)
+			resp, xerr := exec.Execute(ctx, auth, execReq, opts)
 			if xerr != nil {
 				writePreStreamError(w, ClassifyExecError(xerr))
 				return
 			}
-			if d, ok := profile.ParseUsage(resp.Payload); ok {
+			reparsed, haveReparsed := profile.ParseUsage(resp.Payload)
+			if d, ok := ResolveUsage(capture, reparsed, haveReparsed, modelHint.Model); ok {
 				if b, err := json.Marshal(UsageFromDetail(d, modelHint.Model)); err == nil {
 					w.Header().Set("X-Tokenswim-Usage", string(b))
 				}
@@ -82,7 +88,7 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		result, xerr := exec.ExecuteStream(r.Context(), auth, execReq, opts)
+		result, xerr := exec.ExecuteStream(ctx, auth, execReq, opts)
 		if xerr != nil {
 			writePreStreamError(w, ClassifyExecError(xerr))
 			return
@@ -97,7 +103,7 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 				flusher.Flush()
 			}
 		}
-		PipeStream(w, flush, result.Chunks, profile, modelHint.Model)
+		PipeStream(w, flush, result.Chunks, profile, modelHint.Model, capture)
 	}
 }
 

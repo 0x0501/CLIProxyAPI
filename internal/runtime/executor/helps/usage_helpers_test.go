@@ -132,6 +132,29 @@ func TestParseOpenAIUsageNormalizesCacheCreationAlias(t *testing.T) {
 	}
 }
 
+// The codex->chat-completions translator writes cache writes under the
+// non-standard name "cached_creation_tokens" (codex_openai_response.go). Without
+// it in the candidate list the write tokens silently fold into the uncached
+// bucket while the breakdown still reports complete.
+func TestParseOpenAIUsageReadsCachedCreationAlias(t *testing.T) {
+	data := []byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":400,"cached_creation_tokens":300},"completion_tokens_details":{"reasoning_tokens":10}}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.CacheCreationTokens != 300 {
+		t.Fatalf("cache creation tokens = %d, want 300", detail.CacheCreationTokens)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 300 || detail.TokenBreakdown.Input.CacheWriteTokens != 300 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageReadsCachedCreationAliasUnderInputDetails(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_creation_tokens":4}}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.CacheCreationTokens != 4 {
+		t.Fatalf("cache creation tokens = %d, want 4", detail.CacheCreationTokens)
+	}
+}
+
 func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
 	data := []byte(`{"usage":null}`)
 	detail := ParseOpenAIUsage(data)

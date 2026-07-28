@@ -4,13 +4,19 @@ import (
 	"io"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 // PipeStream forwards upstream SSE chunks framed per the given FormatProfile
 // (verbatim for already-framed formats like codex, "data: "-prefixed for raw-JSON
 // formats like openai), and after the upstream stream ends appends exactly one
 // control frame: tokenswim.usage on success, tokenswim.error on a mid-stream error.
-func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.StreamChunk, profile FormatProfile, model string) {
+//
+// The usage frame is built from the raw upstream detail the executor captured,
+// falling back to re-parsing the translated terminal frame (ADR 0019).
+func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.StreamChunk, profile FormatProfile, model string, capture *UsageCapture) {
+	var reparsed usage.Detail
+	var haveReparsed bool
 	for chunk := range chunks {
 		if chunk.Err != nil {
 			// chunk.Err may carry a StatusError (e.g. mid-stream usage-limit -> 429);
@@ -34,13 +40,19 @@ func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.Stream
 				_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			}
 			if d, ok := profile.ParseUsage(raw); ok {
-				_, _ = w.Write(FormatUsageEvent(UsageFromDetail(d, model)))
+				reparsed, haveReparsed = d, true
 			}
 			flush()
 			continue
 		}
 		_, _ = w.Write(framed)
 		_, _ = w.Write([]byte("\n"))
+		flush()
+	}
+	// The bounded wait for raw upstream detail sits here, after the last
+	// translated chunk, so it can never delay a client-visible token.
+	if d, ok := ResolveUsage(capture, reparsed, haveReparsed, model); ok {
+		_, _ = w.Write(FormatUsageEvent(UsageFromDetail(d, model)))
 		flush()
 	}
 }

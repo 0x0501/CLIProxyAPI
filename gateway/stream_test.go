@@ -23,7 +23,7 @@ func TestPipeStreamCodexUnchanged(t *testing.T) {
 	PipeStream(&buf, func() {}, feed(
 		cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}`)},
 		cliproxyexecutor.StreamChunk{Payload: []byte(completed)},
-	), LookupFormat("codex"), "gpt-5-codex")
+	), LookupFormat("codex"), "gpt-5-codex", nil)
 	if !bytes.Contains(buf.Bytes(), []byte(`"delta":"hi"`)) || !bytes.Contains(buf.Bytes(), []byte("\n\nevent: tokenswim.usage")) {
 		t.Fatalf("codex framing regressed: %s", buf.String())
 	}
@@ -38,7 +38,7 @@ func TestPipeStreamOpenAIFramesAndDone(t *testing.T) {
 	PipeStream(&buf, func() {}, feed(
 		cliproxyexecutor.StreamChunk{Payload: []byte(`{"object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}`)},
 		cliproxyexecutor.StreamChunk{Payload: []byte(`{"object":"chat.completion.chunk","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)},
-	), LookupFormat("openai"), "gpt-5")
+	), LookupFormat("openai"), "gpt-5", nil)
 	out := buf.Bytes()
 	if !bytes.Contains(out, []byte("data: {\"object\":\"chat.completion.chunk\"")) {
 		t.Fatalf("openai chunks must be data:-framed: %s", out)
@@ -64,7 +64,7 @@ func TestPipeStreamClaudeForwardsVerbatimAndAppendsUsage(t *testing.T) {
 	for _, c := range claudeChunks {
 		scs = append(scs, cliproxyexecutor.StreamChunk{Payload: c})
 	}
-	PipeStream(&buf, func() {}, feed(scs...), LookupFormat("claude"), "gpt-5")
+	PipeStream(&buf, func() {}, feed(scs...), LookupFormat("claude"), "gpt-5", nil)
 	out := buf.Bytes()
 
 	// Anthropic events forwarded verbatim (identity Frame).
@@ -96,7 +96,7 @@ func TestPipeStreamOnChunkErrorAppendsErrorFrame(t *testing.T) {
 	PipeStream(&buf, func() {}, feed(
 		cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.output_text.delta"}`)},
 		cliproxyexecutor.StreamChunk{Err: errors.New("connection reset")},
-	), LookupFormat("codex"), "m")
+	), LookupFormat("codex"), "m", nil)
 	if !bytes.Contains(buf.Bytes(), []byte("event: tokenswim.error")) || !bytes.Contains(buf.Bytes(), []byte(`"disposition":"upstream_error"`)) {
 		t.Fatalf("error frame not appended: %s", buf.String())
 	}
