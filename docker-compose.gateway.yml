@@ -1,0 +1,20 @@
+# Standalone VPS deployment for tokenswim-gateway (ghcr image built by
+# .github/workflows/gateway-image.yml).
+#
+# The gateway has NO caller authentication: /invoke executes with whatever
+# credential the request body carries. Never publish 8787 on a public
+# interface — keep the 127.0.0.1 bind and put your TLS reverse proxy or
+# Cloudflare Tunnel in front (that also gives the Worker an HTTPS endpoint).
+#
+# Health probe: GET /healthz — external only; the distroless image has no
+# shell/curl, so an in-container docker healthcheck is not possible.
+services:
+  gateway:
+    image: ghcr.io/0x0501/tokenswim-gateway:latest
+    container_name: tokenswim-gateway
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:8787:8787"
+    # environment:
+    #   PROXY_URL: socks5://user:pass@host:port  # optional: route upstream provider traffic through a forward proxy
