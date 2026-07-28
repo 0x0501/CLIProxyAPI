@@ -3,7 +3,7 @@
 # Upstream's tag-triggered workflows (docker-image.yml, release.yaml) are
 # disabled on this fork GitHub-side via `gh workflow disable` — no file edits,
 # so upstream syncs never conflict.
-name: gateway-image
+name: 🐳 Publish Gateway Image (GHCR)
 
 on:
   push:
