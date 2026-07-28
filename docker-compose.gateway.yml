@@ -2,9 +2,9 @@
 # .github/workflows/gateway-image.yml).
 #
 # The gateway has NO caller authentication: /invoke executes with whatever
-# credential the request body carries. Never publish 8787 on a public
-# interface — keep the 127.0.0.1 bind and put your TLS reverse proxy or
-# Cloudflare Tunnel in front (that also gives the Worker an HTTPS endpoint).
+# credential the request body carries. 8787 is published on all interfaces,
+# so restrict reachability outside compose — firewall/security group allowing
+# only your Worker's egress, or a TLS reverse proxy in front.
 #
 # Health probe: GET /healthz — external only; the distroless image has no
 # shell/curl, so an in-container docker healthcheck is not possible.
@@ -15,6 +15,6 @@ services:
     restart: unless-stopped
     read_only: true
     ports:
-      - "127.0.0.1:8787:8787"
+      - "8787:8787"
     # environment:
     #   PROXY_URL: socks5://user:pass@host:port  # optional: route upstream provider traffic through a forward proxy
