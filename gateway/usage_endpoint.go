@@ -25,6 +25,16 @@ type usageEnvelope struct {
 // authenticated request that returns quota utilization WITHOUT a chat request.
 // Adding claude/gemini = one more case (e.g. GET api.anthropic.com/api/oauth/usage
 // with `anthropic-beta: oauth-2025-04-20`).
+// xAI billing-credits constants mirror the OAuth inference identity the
+// tokenswim-owned executor already sends to cli-chat-proxy (ADR 0028). Kept
+// local to the gateway package so this additive surface does not reach into
+// upstream executor packages.
+const (
+	xaiBillingCreditsURL  = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+	xaiUsageTokenAuth     = "xai-grok-cli"
+	xaiUsageClientVersion = "0.2.120"
+)
+
 func usageRequest(ctx context.Context, provider string, auth *cliproxyauth.Auth) (*http.Request, error) {
 	switch provider {
 	case "codex":
@@ -42,6 +52,26 @@ func usageRequest(ctx context.Context, provider string, auth *cliproxyauth.Auth)
 			req.Header.Set("ChatGPT-Account-Id", acct)
 		}
 		req.Header.Set("User-Agent", "codex_cli_rs/0.44.0")
+		return req, nil
+	case "xai":
+		access, _ := auth.Metadata["access_token"].(string)
+		if access == "" {
+			return nil, errors.New("usage: missing access token")
+		}
+		// OIDC sub is stored as account_id on tokenswim auth xai upload and is
+		// the x-userid Grok Build sends on the same billing-credits GET.
+		acct, _ := auth.Metadata["account_id"].(string)
+		if acct == "" {
+			return nil, errors.New("usage: missing account id")
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiBillingCreditsURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+access)
+		req.Header.Set("X-XAI-Token-Auth", xaiUsageTokenAuth)
+		req.Header.Set("x-userid", acct)
+		req.Header.Set("x-grok-client-version", xaiUsageClientVersion)
 		return req, nil
 	default:
 		return nil, errors.New("usage: unsupported provider " + provider)
