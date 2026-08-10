@@ -43,6 +43,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
+	var replayScope claudeThinkingReplayScope
+	if claudeThinkingReplayEnabled(auth, req, opts) {
+		req, replayScope = prepareClaudeThinkingReplayRequest(ctx, auth, req, opts)
+	}
+	defer func() {
+		if err != nil && replayScope.replayApplied && shouldClearKimiThinkingReplayAfterError(err) {
+			clearClaudeThinkingReplayContent(ctx, replayScope)
+		}
+	}()
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -54,8 +63,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if oauthToken {
 		claudeSessionID = helps.ClaudeAgentSessionUUIDForRequest(incomingHeaders, originalPayload, req.Payload, confirmedClaudeCode, opts.Metadata, req.Metadata)
 	}
-	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true)
-	body := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true)
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true, helps.APIKeyModelIsCompat(req))
+	body := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true, helps.APIKeyModelIsCompat(req))
 	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
@@ -126,7 +135,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, mcpAliases)
 	}
-	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
+	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel, helps.APIKeyModelIsCompat(req))
 	if oauthToken {
 		bodyForUpstream, _, err = helps.ApplyClaudeCredentialMetadata(bodyForUpstream, auth, claudeSessionID)
 		if err != nil {
@@ -228,6 +237,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			return true
 		}
+		emitResponseError := func(errResponse error) {
+			errResponse = wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errResponse)
+			helps.RecordAPIResponseError(ctx, e.cfg, errResponse)
+			reporter.PublishFailure(ctx, errResponse)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errResponse}:
+			case <-ctx.Done():
+			}
+		}
 
 		// If the response target is Claude, directly forward complete SSE events without translation.
 		if responseFormat == to {
@@ -256,8 +274,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
-				line = restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
-				line = e.restoreResponseModel(line, req.Model)
+				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
+				if errRestore != nil {
+					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
+					return
+				}
+				line = e.restoreResponseModel(restoredLine, req.Model)
 				event.Write(line)
 				event.WriteByte('\n')
 				if len(bytes.TrimSpace(line)) == 0 && !flushEvent() {
@@ -301,8 +323,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
-			line = restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
-			line = e.restoreResponseModel(line, req.Model)
+			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
+			if errRestore != nil {
+				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
+				return
+			}
+			line = e.restoreResponseModel(restoredLine, req.Model)
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
@@ -339,7 +365,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			commitClaudeDiagnostics(diagnosticsState, upstreamMessageID)
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	result := &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}
+	if replayScope.valid() {
+		result = wrapClaudeThinkingReplayStream(ctx, result, replayScope)
+	}
+	return result, nil
 }
 
 func validateClaudeStreamingResponse(data []byte) error {
