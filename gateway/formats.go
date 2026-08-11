@@ -19,6 +19,12 @@ type FormatProfile struct {
 	Frame      func([]byte) []byte
 	IsTerminal func([]byte) bool
 	ParseUsage func([]byte) (usage.Detail, bool)
+	// AtomicChunks: each StreamChunk is one complete SSE event after Frame
+	// (openai raw JSON). When false, chunks are Scanner lines or pre-framed
+	// multi-line SSE (codex / openai-response / claude) and need reassembly.
+	AtomicChunks bool
+	// AppendDone: emit a trailing "data: [DONE]" after the terminal event.
+	// Orthogonal to AtomicChunks — only openai sets both today.
 	AppendDone bool
 }
 
@@ -51,11 +57,12 @@ func codexUsage(raw []byte) (usage.Detail, bool) {
 // codexStyle: chunks are already "data: {...}"; terminal = response.completed;
 // usage from response.usage. Used for "codex" and "openai-response".
 var codexStyle = FormatProfile{
-	Extract:    stripData,
-	Frame:      func(b []byte) []byte { return b },
-	IsTerminal: func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "response.completed" },
-	ParseUsage: codexUsage,
-	AppendDone: false,
+	Extract:      stripData,
+	Frame:        func(b []byte) []byte { return b },
+	IsTerminal:   func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "response.completed" },
+	ParseUsage:   codexUsage,
+	AtomicChunks: false,
+	AppendDone:   false,
 }
 
 // openaiStyle: chunks are raw chat.completion.chunk JSON (no "data:"); the
@@ -68,7 +75,8 @@ var openaiStyle = FormatProfile{
 		d := helps.ParseOpenAIUsage(raw)
 		return d, d.TotalTokens > 0
 	},
-	AppendDone: true,
+	AtomicChunks: true,
+	AppendDone:   true,
 }
 
 // extractClaudeEvent pulls the JSON for terminal/usage detection out of a claude
@@ -112,7 +120,8 @@ var claudeStyle = FormatProfile{
 		d := helps.ParseClaudeUsage(raw)
 		return d, usageHasTokens(d)
 	},
-	AppendDone: false,
+	AtomicChunks: false,
+	AppendDone:   false,
 }
 
 var formatProfiles = map[string]FormatProfile{
