@@ -15,6 +15,93 @@ services:
     restart: unless-stopped
     read_only: true
     ports:
+      # The relay below shares this namespace, so every port either container
+      # publishes is declared here.
       - "8787:8787"
     # environment:
     #   PROXY_URL: socks5://user:pass@host:port  # optional: route upstream provider traffic through a forward proxy
+
+  # The Proof-pool relay (ADR 0039). Optional: leave it out and the gateway
+  # serves ordinary traffic exactly as before — the relay only ever receives a
+  # request whose credential the Worker rewrote to point at it.
+  #
+  # Delete this service unless you have set `relayProofOrigin` in Tokenswim's
+  # config; a relay nobody addresses is a secret sitting on disk for nothing.
+  #
+  # docs/ops/relay-proof-deployment.md has the full first-run procedure.
+  relay:
+    image: ghcr.io/0x0501/tokenswim/prover:latest
+    restart: unless-stopped
+
+    # Loopback, and not a shortcut for one. ADR 0039 puts the relay on loopback
+    # in both gateway shapes, and `relayProofOrigin` is one global string that
+    # the Mesh node and every Container have to answer on — so the address here
+    # must be literally the same http://127.0.0.1:9000 the Container's in-image
+    # sidecar answers on.
+    #
+    # Two sibling services do not give that. Each would get its own network
+    # namespace and the gateway would have to dial http://relay:9000, which is
+    # a different string, resolves nowhere inside a Container, and puts a
+    # Consumer's plaintext prompt on a bridge network where anything else
+    # attached to it can read the frames. Sharing the gateway's namespace makes
+    # 127.0.0.1 mean the same thing in both shapes and keeps the relay off the
+    # network entirely.
+    #
+    # The cost is that this container may not declare `ports`, `networks` or
+    # `expose` — the namespace belongs to `gateway` and its `ports` block above
+    # covers both. That is the desired shape anyway: the relay holds the shared
+    # secret and forwards to the providers in its own table, so a published
+    # port on it is precisely the public relay endpoint ADR 0039 moved away
+    # from.
+    network_mode: "service:gateway"
+    depends_on:
+      - gateway
+
+    environment:
+      # Read from the environment rather than passed as -key: argv is
+      # world-readable and this is the identity every claim is filed under.
+      PROVER_PRIVATE_KEY: ${PROVER_PRIVATE_KEY:?set PROVER_PRIVATE_KEY to the claim owner's secp256k1 key}
+
+    volumes:
+      # The provider slug -> real base URL table. The relay never takes an
+      # upstream from the caller, so this file is the whole of what it will
+      # forward to.
+      - ${PROVER_UPSTREAMS:-./upstreams.json}:/etc/tokenswim/upstreams.json:ro
+      # The secret shared with Tokenswim: it verifies every nonce and
+      # authenticates every report and spool.
+      #
+      # `chown 65532:65532 relay.secret && chmod 600 relay.secret` on the host
+      # before the first `up`. The image runs as `nonroot` and a bind mount
+      # keeps the host's ownership, and the binary refuses a secret any group
+      # or other can read — so a file the deploying user owns fails one way at
+      # 0600 (permission denied) and the other way at 0644 (refused as world
+      # readable). Either shows up as a container restarting every second with
+      # one line of log.
+      - ${PROVER_SECRET_FILE:-./relay.secret}:/etc/tokenswim/relay.secret:ro
+
+    command:
+      - -serve
+      # A Mesh node proves what it carried, in process, once the session
+      # closes. Drop -work and pass PROVER_CIRCUITS= empty to make this a
+      # spool-only relay whose rows a second deployment finishes.
+      - -work
+      # 127.0.0.1 and not 0.0.0.0: in a shared namespace loopback already
+      # reaches the gateway, and binding wider would put the relay on the
+      # host-facing interfaces `gateway` publishes.
+      - -listen=127.0.0.1:9000
+      - -upstreams=/etc/tokenswim/upstreams.json
+      - -secret-file=/etc/tokenswim/relay.secret
+      - -circuits=${PROVER_CIRCUITS-/usr/share/tokenswim-prover/circuits}
+      - -ingest=${PROVER_INGEST:?set PROVER_INGEST to the Tokenswim origin outcomes are reported to}
+      - -attestor=${PROVER_ATTESTOR:?set PROVER_ATTESTOR to the attestor websocket endpoint}
+      - -attestor-version=${PROVER_ATTESTOR_VERSION:?set PROVER_ATTESTOR_VERSION to the attestor build claims are verified by}
+      - -registry=${PROVER_REGISTRY:?set PROVER_REGISTRY to the Witness registry base URL}
+
+    healthcheck:
+      # The image is distroless and has neither a shell nor curl, so the only
+      # thing that can probe this process is the process.
+      test: ["CMD", "/usr/local/bin/prover", "-healthcheck", "-listen=127.0.0.1:9000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

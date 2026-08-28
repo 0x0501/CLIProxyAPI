@@ -5,8 +5,34 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/tokenswim-gateway ./cmd/tokenswim-gateway
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/tokenswim-supervisor ./cmd/tokenswim-supervisor
+
+# The Proof-pool relay (ADR 0039) is a loopback sidecar in both gateway shapes.
+# In the Mesh shape that is a second container sharing this one's network
+# namespace (docker-compose.gateway.yml); here it has to be a second process in
+# this image, because a Cloudflare Container is one image and the Worker only
+# ever reaches port 8787.
+#
+# It arrives as a build stage rather than as source. apps/prover is a different
+# Go module in a different repository, and this build's context is the
+# container_src submodule — it cannot see that source and could not resolve its
+# module graph if it could. A published image sidesteps both: `docker build`
+# resolves the tag locally first, so a `docker build -f apps/prover/Dockerfile
+# -t ghcr.io/0x0501/tokenswim/prover:latest .` in the tokenswim repo is enough
+# to build this one offline.
+#
+# Only the binary is copied. The circuits that come with that image are ~50 MB
+# of gnark proving keys, and a `lite` instance holds neither them nor the one to
+# three seconds of CPU a claim costs — so the Container relay runs without
+# -circuits, which is what puts it in the spool-only shape ADR 0039 gives it.
+FROM ghcr.io/0x0501/tokenswim/prover:latest AS relay
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/tokenswim-gateway /tokenswim-gateway
+COPY --from=build /out/tokenswim-supervisor /tokenswim-supervisor
+COPY --from=relay /usr/local/bin/prover /usr/local/bin/prover
 EXPOSE 8787
-ENTRYPOINT ["/tokenswim-gateway"]
+# The supervisor, not the gateway. It starts the gateway either way, and the
+# relay beside it once PROVER_RELAY_SECRET is set; the first of the two to exit
+# takes the container with it.
+ENTRYPOINT ["/tokenswim-supervisor"]
