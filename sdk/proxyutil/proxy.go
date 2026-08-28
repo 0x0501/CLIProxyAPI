@@ -9,11 +9,57 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 
 	"golang.org/x/net/proxy"
 )
+
+// bypassProxy reports whether a destination must be dialed directly even when a
+// proxy is configured.
+//
+// The Proof-pool relay is a loopback sidecar (ADR 0039): the Worker rewrites a
+// credential's base_url to http://127.0.0.1:9000/..., and the executor dials it
+// with whatever transport the configured proxy produced. Handing that address
+// to a forward proxy asks a machine on the other side of the network to reach
+// into this container's namespace, so on every node with PROXY_URL set the
+// sidecar would be unreachable. Private and link-local ranges join loopback for
+// the same reason: those are the deployment's own network, never a provider.
+func bypassProxy(hostport string) bool {
+	host := hostport
+	if h, _, errSplit := net.SplitHostPort(hostport); errSplit == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, errParse := netip.ParseAddr(strings.Trim(host, "[]"))
+	if errParse != nil {
+		return false
+	}
+	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast()
+}
+
+// bypassDialer sends loopback and private destinations straight out and
+// everything else through the wrapped proxy dialer. It implements
+// proxy.ContextDialer because callers type-assert for it and fail the request
+// when the assertion does not hold.
+type bypassDialer struct{ proxied proxy.Dialer }
+
+func (d bypassDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
+}
+
+func (d bypassDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if bypassProxy(addr) {
+		return proxy.Direct.DialContext(ctx, network, addr)
+	}
+	if contextDialer, ok := d.proxied.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
+	}
+	return d.proxied.Dial(network, addr)
+}
 
 // Mode describes how a proxy setting should be interpreted.
 type Mode int
@@ -112,13 +158,16 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			}
 			transport := cloneDefaultTransport()
 			transport.Proxy = nil
-			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
-			}
+			transport.DialContext = bypassDialer{proxied: dialer}.DialContext
 			return transport, setting.Mode, nil
 		}
 		transport := cloneDefaultTransport()
-		transport.Proxy = http.ProxyURL(setting.URL)
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			if bypassProxy(req.URL.Host) {
+				return nil, nil
+			}
+			return setting.URL, nil
+		}
 		return transport, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
@@ -139,13 +188,13 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 		return proxy.Direct, setting.Mode, nil
 	case ModeProxy:
 		if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
-			return &httpConnectDialer{proxyURL: setting.URL, dialer: proxy.Direct}, setting.Mode, nil
+			return bypassDialer{proxied: &httpConnectDialer{proxyURL: setting.URL, dialer: proxy.Direct}}, setting.Mode, nil
 		}
 		dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
 		if errDialer != nil {
 			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
 		}
-		return dialer, setting.Mode, nil
+		return bypassDialer{proxied: dialer}, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}

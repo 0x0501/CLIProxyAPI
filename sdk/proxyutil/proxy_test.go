@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 func mustDefaultTransport(t *testing.T) *http.Transport {
@@ -393,5 +395,72 @@ func TestParseErrorDoesNotExposeProxyCredentials(t *testing.T) {
 		strings.Contains(errParse.Error(), "user") ||
 		strings.Contains(errParse.Error(), "secret") {
 		t.Fatalf("parse error exposes proxy credentials: %q", errParse.Error())
+	}
+}
+
+// The Proof-pool relay is a loopback sidecar: a proxied transport that sends
+// 127.0.0.1 to the forward proxy makes it unreachable on every node with
+// PROXY_URL set (ADR 0039).
+func TestProxiedTransportBypassesLoopbackAndPrivateDestinations(t *testing.T) {
+	t.Parallel()
+
+	transport, _, errBuild := BuildHTTPTransport("http://proxy.example.com:8080")
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransport returned error: %v", errBuild)
+	}
+
+	for _, tc := range []struct {
+		target string
+		direct bool
+	}{
+		{"http://127.0.0.1:9000/codex/abc", true},
+		{"http://localhost:9000/codex/abc", true},
+		{"http://[::1]:9000/codex/abc", true},
+		{"http://10.1.2.3:9000/codex/abc", true},
+		{"http://192.168.65.254:10808/", true},
+		{"https://api.x.ai/v1/messages", false},
+		{"https://8.8.8.8/", false},
+	} {
+		req, errRequest := http.NewRequest(http.MethodGet, tc.target, nil)
+		if errRequest != nil {
+			t.Fatalf("http.NewRequest(%q) returned error: %v", tc.target, errRequest)
+		}
+		proxyURL, errProxy := transport.Proxy(req)
+		if errProxy != nil {
+			t.Fatalf("transport.Proxy(%q) returned error: %v", tc.target, errProxy)
+		}
+		if tc.direct && proxyURL != nil {
+			t.Errorf("%s: proxy = %v, want direct", tc.target, proxyURL)
+		}
+		if !tc.direct && proxyURL == nil {
+			t.Errorf("%s: proxy = nil, want the configured proxy", tc.target)
+		}
+	}
+}
+
+// BuildDialer feeds the uTLS paths, which type-assert proxy.ContextDialer and
+// fail the request outright when the assertion does not hold.
+func TestBuildDialerBypassesLoopbackAndStaysAContextDialer(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"http://proxy.example.com:8080", "socks5://proxy.example.com:1080"} {
+		dialer, _, errBuild := BuildDialer(raw)
+		if errBuild != nil {
+			t.Fatalf("BuildDialer(%q) returned error: %v", raw, errBuild)
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			t.Fatalf("BuildDialer(%q) does not implement proxy.ContextDialer", raw)
+		}
+
+		// Nothing listens here; a direct dial refuses immediately, while a dial
+		// routed at proxy.example.com would fail on DNS instead.
+		_, errDial := contextDialer.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+		if errDial == nil {
+			t.Fatalf("BuildDialer(%q): dial to a closed loopback port succeeded", raw)
+		}
+		if strings.Contains(errDial.Error(), "proxy.example.com") {
+			t.Errorf("BuildDialer(%q): loopback dial went through the proxy: %v", raw, errDial)
+		}
 	}
 }
