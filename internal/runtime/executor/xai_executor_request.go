@@ -309,23 +309,34 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth, clientHeade
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
-// requests. When using_api is true, this matches the standard
-// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
-// when using_api is false and the resolved chat base URL is the official CLI
-// chat-proxy endpoint.
+// requests. When using_api is true, this matches the standard applyXAIHeaders
+// behavior. Otherwise the request is a Grok CLI OAuth chat request, and it
+// carries the CLI identity headers.
+//
+// The identity belongs to the credential, not to the address. Only the CLI
+// chat endpoint accepts a Grok CLI OAuth token, so an explicit base_url under
+// using_api=false names a stand-in for that endpoint — a proxy, a relay, a
+// test server — and the stand-in has to receive the request the endpoint would
+// have received, byte for byte, because the request is only ever going one
+// place.
+//
+// Testing the resolved base URL here instead was silent and total: any
+// base_url that is not the compiled CLI chat-proxy literal dropped all five
+// headers, and the endpoint answers a request without x-grok-client-version
+// with 426 "Your Grok CLI version (none) is outdated" whatever the credential
+// says. Custom headers still override each of these, below, which is where an
+// operator who wants a different identity says so.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	if xaiUsingAPI(auth) {
 		applyXAIHeaders(r, auth, token, stream, sessionID, clientHeaders...)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
-		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
-		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
-		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
-	}
+	r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+	r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
+	r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
+	r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
+	r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
 	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 

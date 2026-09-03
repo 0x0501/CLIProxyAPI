@@ -5237,29 +5237,35 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 	})
 
-	t.Run("no cli headers on custom gateway with using_api false", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "https://gateway.example.com/responses", nil)
+	// A relay in front of the CLI chat endpoint is the case this exists for:
+	// Tokenswim's Proof pool hands the executor a per-request loopback address
+	// as base_url, and the request that leaves here is the one the endpoint
+	// behind the relay has to accept. Dropping the identity headers because the
+	// address is not the compiled literal earns a 426 from the far end.
+	t.Run("cli headers on a relayed base url with using_api false", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:9000/responses", nil)
 		auth := &cliproxyauth.Auth{
 			Attributes: map[string]string{
-				"base_url":      "https://gateway.example.com/v1",
+				"base_url":      "http://127.0.0.1:9000/relay/v1/xai/req-1/nonce",
 				xaiUsingAPIAttr: "false",
 			},
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", false, "")
 
-		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiTokenAuthHeader, got)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
+			t.Fatalf("%s = %q, want %q through a relay", xaiTokenAuthHeader, got, xaiTokenAuthValue)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiClientVersionHeader, got)
+		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
+			t.Fatalf("%s = %q, want %q through a relay", xaiClientVersionHeader, got, xaiClientVersionValue)
 		}
-		for _, header := range []string{"x-grok-client-identifier", "x-authenticateresponse"} {
-			if got := req.Header.Get(header); got != "" {
-				t.Fatalf("%s = %q, want empty for custom gateway", header, got)
-			}
+		if got := req.Header.Get("x-grok-client-identifier"); got != "grok-shell" {
+			t.Fatalf("x-grok-client-identifier = %q, want grok-shell through a relay", got)
 		}
-		if got := req.Header.Get("User-Agent"); got != "" {
-			t.Fatalf("User-Agent = %q, want empty for custom gateway", got)
+		if got := req.Header.Get("x-authenticateresponse"); got != "authenticate-response" {
+			t.Fatalf("x-authenticateresponse = %q, want authenticate-response through a relay", got)
+		}
+		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiClientVersionValue {
+			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s through a relay", got, xaiClientVersionValue)
 		}
 	})
 
@@ -5310,12 +5316,15 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 	})
 }
 
-func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
-	var gotTokenAuth string
-	var gotClientVersion string
+// The end-to-end half of "the identity belongs to the credential": an OAuth
+// chat request addressed at a stand-in for the CLI chat endpoint — which is
+// what a Proof-pool relay address is — must arrive carrying the whole CLI
+// fingerprint. This is the test that a unit test on applyXAIChatHeaders cannot
+// stand in for, because the executor is what resolves the base URL.
+func TestXAIExecutorExecuteChatSendsCLIIdentityThroughARelayedBaseURL(t *testing.T) {
+	var got http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
+		got = r.Header.Clone()
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	}))
@@ -5340,11 +5349,19 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiTokenAuthHeader, gotTokenAuth)
-	}
-	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiClientVersionHeader, gotClientVersion)
+	// x-grok-client-version is the load-bearing one: without it the endpoint
+	// answers 426 "Your Grok CLI version (none) is outdated" whatever the
+	// credential says. The rest travel with it.
+	for header, want := range map[string]string{
+		xaiTokenAuthHeader:            xaiTokenAuthValue,
+		xaiClientVersionHeader:        xaiClientVersionValue,
+		xaiClientIdentifierHeader:     xaiClientIdentifierValue,
+		xaiAuthenticateResponseHeader: xaiAuthenticateResponseValue,
+		"User-Agent":                  "xai-grok-workspace/" + xaiClientVersionValue,
+	} {
+		if have := got.Get(header); have != want {
+			t.Fatalf("the upstream behind the relay saw %s = %q, want %q", header, have, want)
+		}
 	}
 }
 
