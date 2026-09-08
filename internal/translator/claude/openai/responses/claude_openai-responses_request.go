@@ -1,7 +1,11 @@
 package responses
 
 import (
+	"strconv"
 	"strings"
+	"unicode/utf16"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -10,6 +14,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+)
+
+const (
+	defaultClaudeResponsesMaxTokens = 32000
+	defaultFableResponsesMaxTokens  = 64000
 )
 
 // ConvertOpenAIResponsesRequestToClaude transforms an OpenAI Responses API request
@@ -34,13 +43,14 @@ func ConvertOpenAIResponsesRequestToClaudeWithCompat(modelName string, inputRawJ
 }
 
 func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
-	rawJSON := inputRawJSON
+	rawJSON := normalizeCodexAgentMessages(inputRawJSON)
 
 	userID := common.DeriveClaudeUserID(rawJSON)
 
 	// Base Claude message payload
 	out := []byte(`{"model":"","max_tokens":32000,"messages":[],"metadata":{}}`)
 	out, _ = sjson.SetBytes(out, "metadata.user_id", userID)
+	out, _ = sjson.SetBytes(out, "max_tokens", defaultClaudeResponsesMaxTokensForModel(modelName))
 
 	root := gjson.ParseBytes(rawJSON)
 
@@ -97,8 +107,12 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
 	// Max tokens
-	if mot := root.Get("max_output_tokens"); mot.Exists() {
-		out, _ = sjson.SetBytes(out, "max_tokens", mot.Int())
+	if mot := root.Get("max_output_tokens"); mot.Exists() && mot.Type != gjson.Null {
+		val := mot.Int()
+		if info := registry.LookupModelInfo(modelName, "claude"); info != nil && info.MaxCompletionTokens > 0 && val > int64(info.MaxCompletionTokens) {
+			val = int64(info.MaxCompletionTokens)
+		}
+		out, _ = sjson.SetBytes(out, "max_tokens", val)
 	}
 
 	// Stream
@@ -165,6 +179,14 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		})
 	}
 
+	formatResult := root.Get("text.format")
+	if !formatResult.Exists() {
+		formatResult = root.Get("response_format")
+	}
+	if formatInstruction := common.BuildClaudeStructuredOutputInstruction(formatResult); formatInstruction != "" {
+		appendSystemText(formatInstruction, gjson.Result{})
+	}
+
 	// input array processing
 	var pendingRole string
 	var pendingParts [][]byte
@@ -189,7 +211,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			msg, _ = sjson.SetBytes(msg, "role", pendingRole)
 			if len(parts) == 1 {
 				part := gjson.ParseBytes(parts[0])
-				if part.Get("type").String() == "text" && !part.Get("cache_control").Exists() {
+				if part.Get("type").String() == "text" && !part.Get("cache_control").Exists() && !part.Get("citations").Exists() {
 					msg, _ = sjson.SetBytes(msg, "content", part.Get("text").String())
 				} else {
 					msg, _ = sjson.SetRawBytes(msg, "content", common.JoinRawArray(parts))
@@ -223,6 +245,32 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 		pendingRole = "assistant"
 		pendingToolUseParts = append(pendingToolUseParts, toolUse)
+	}
+	appendReasoning := func(reasoningPart []byte) {
+		if len(reasoningPart) == 0 {
+			return
+		}
+		if pendingRole != "" && pendingRole != "assistant" {
+			flushPendingMessage()
+		}
+		pendingRole = "assistant"
+
+		// Client tool calls normally stay at the end of an assistant message, but
+		// a later reasoning item makes them a real separator between thinking blocks.
+		if len(pendingToolUseParts) > 0 {
+			pendingParts = append(pendingParts, pendingToolUseParts...)
+			pendingToolUseParts = nil
+		}
+
+		currentType := gjson.GetBytes(reasoningPart, "type").String()
+		if currentType == "thinking" && len(pendingParts) > 0 {
+			lastIdx := len(pendingParts) - 1
+			if gjson.GetBytes(pendingParts[lastIdx], "type").String() == "thinking" {
+				pendingParts[lastIdx] = reasoningPart
+				return
+			}
+		}
+		pendingParts = append(pendingParts, reasoningPart)
 	}
 
 	lastToolResult := map[string]gjson.Result{}
@@ -264,6 +312,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 								txt := t.String()
 								contentPart := []byte(`{"type":"text","text":""}`)
 								contentPart, _ = sjson.SetBytes(contentPart, "text", txt)
+								contentPart = attachClaudeCitations(contentPart, part.Get("annotations"))
 								contentPart = common.AttachCacheControl(contentPart, part)
 								partsJSON = append(partsJSON, contentPart)
 							}
@@ -272,6 +321,15 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 							} else {
 								role = "assistant"
 							}
+						case "refusal":
+							// Claude has no refusal block; the text keeps the turn intact.
+							if t := part.Get("refusal"); t.Exists() && t.String() != "" {
+								contentPart := []byte(`{"type":"text","text":""}`)
+								contentPart, _ = sjson.SetBytes(contentPart, "text", t.String())
+								contentPart = common.AttachCacheControl(contentPart, part)
+								partsJSON = append(partsJSON, contentPart)
+							}
+							role = "assistant"
 						case "input_image":
 							url := part.Get("image_url").String()
 							if url == "" {
@@ -359,10 +417,15 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					appendParts(role, partsJSON...)
 				}
 
-			case "reasoning":
-				if thinkingPart := convertResponsesReasoningToClaudeThinking(item, preserveEmptyThinkingBlocks); len(thinkingPart) > 0 {
-					appendParts("assistant", thinkingPart)
+			case "web_search_call":
+				// Rebuild the Claude server-side search pair so the replayed turn
+				// still shows the search and its hits.
+				if blocks := convertResponsesWebSearchCallToClaudeBlocks(item); len(blocks) > 0 {
+					appendParts("assistant", blocks...)
 				}
+
+			case "reasoning":
+				appendReasoning(convertResponsesReasoningToClaudeThinking(item, preserveEmptyThinkingBlocks))
 
 			case "function_call", "custom_tool_call":
 				// Map to assistant tool_use. Freeform custom input is wrapped in an
@@ -417,14 +480,28 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				toolResult = applyResponsesToolResultContent(toolResult, output)
 
 				appendParts("user", toolResult)
+
+			default:
+				// Reachability guard: Claude only ever receives the item types this
+				// switch handles. A new one means the client gained a capability
+				// whose Claude counterpart still has to be decided, so make the gap
+				// visible instead of dropping the turn content in silence.
+				if typ := item.Get("type").String(); typ != "" {
+					log.Debugf("responses->claude: unmapped input item type %q", typ)
+				}
 			}
 			return true
 		})
 	}
 	flushPendingMessage()
-	// Preserve a minimal conversational turn for system-only inputs so downstream
-	// validation still sees a Claude-shaped request.
-	if len(messageBlocks) == 0 && len(systemBlocks) > 0 {
+	hadMessages := len(messageBlocks) > 0
+	if !preserveEmptyThinkingBlocks {
+		messageBlocks = stripTrailingClaudeThinkingBlocks(messageBlocks)
+		messageBlocks = dropUnsupportedClaudeAssistantPrefill(modelName, messageBlocks)
+	}
+	// Preserve a minimal conversational turn for system-only inputs or when messages became empty
+	// so downstream validation still sees a Claude-shaped request.
+	if len(messageBlocks) == 0 && (len(systemBlocks) > 0 || hadMessages) {
 		messageBlocks = append(messageBlocks, []byte(`{"role":"user","content":[{"type":"text","text":""}]}`))
 	}
 	out = common.SetRawArrayItems(out, "messages", messageBlocks)
@@ -511,6 +588,17 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	return out
 }
 
+func defaultClaudeResponsesMaxTokensForModel(modelName string) int {
+	maxTokens := defaultClaudeResponsesMaxTokens
+	if strings.Contains(strings.ToLower(strings.TrimSpace(modelName)), "fable") {
+		maxTokens = defaultFableResponsesMaxTokens
+	}
+	if info := registry.LookupModelInfo(modelName, "claude"); info != nil && info.MaxCompletionTokens > 0 && info.MaxCompletionTokens < maxTokens {
+		return info.MaxCompletionTokens
+	}
+	return maxTokens
+}
+
 // isResponsesSystemLevelRole reports whether an input item carries system-level
 // authority. The Responses API ranks developer and system instructions above
 // user content, so both map to Claude's system slot rather than a user turn.
@@ -521,6 +609,84 @@ func isResponsesSystemLevelRole(role string) bool {
 	default:
 		return false
 	}
+}
+
+// dropUnsupportedClaudeAssistantPrefill removes a trailing assistant message for
+// Claude model families that reject assistant message prefill (e.g., Fable,
+// Opus 5, Sonnet 4.6).
+func dropUnsupportedClaudeAssistantPrefill(modelName string, messages [][]byte) [][]byte {
+	if !claudeModelRejectsAssistantPrefill(modelName) || len(messages) == 0 {
+		return messages
+	}
+	last := gjson.ParseBytes(messages[len(messages)-1])
+	if !strings.EqualFold(strings.TrimSpace(last.Get("role").String()), "assistant") {
+		return messages
+	}
+	return messages[:len(messages)-1]
+}
+
+// stripTrailingClaudeThinkingBlocks removes trailing thinking and
+// redacted_thinking blocks from the final assistant message. Anthropic rejects
+// requests whose final assistant content block is thinking. If no content
+// blocks remain after stripping, the assistant message itself is dropped.
+func stripTrailingClaudeThinkingBlocks(messages [][]byte) [][]byte {
+	if len(messages) == 0 {
+		return messages
+	}
+	lastIdx := len(messages) - 1
+	last := gjson.ParseBytes(messages[lastIdx])
+	if !strings.EqualFold(strings.TrimSpace(last.Get("role").String()), "assistant") {
+		return messages
+	}
+	content := last.Get("content")
+	if !content.IsArray() {
+		return messages
+	}
+	parts := content.Array()
+	end := len(parts)
+	for end > 0 {
+		partType := strings.TrimSpace(parts[end-1].Get("type").String())
+		if partType == "thinking" || partType == "redacted_thinking" {
+			end--
+		} else {
+			break
+		}
+	}
+	if end == len(parts) {
+		return messages
+	}
+	if end == 0 {
+		return messages[:lastIdx]
+	}
+	remainingParts := make([][]byte, end)
+	for i := 0; i < end; i++ {
+		remainingParts[i] = []byte(parts[i].Raw)
+	}
+	var updatedMsg []byte
+	if end == 1 {
+		part := parts[0]
+		if part.Get("type").String() == "text" && !part.Get("cache_control").Exists() && !part.Get("citations").Exists() {
+			updatedMsg, _ = sjson.SetBytes(messages[lastIdx], "content", part.Get("text").String())
+		} else {
+			updatedMsg, _ = sjson.SetRawBytes(messages[lastIdx], "content", common.JoinRawArray(remainingParts))
+		}
+	} else {
+		updatedMsg, _ = sjson.SetRawBytes(messages[lastIdx], "content", common.JoinRawArray(remainingParts))
+	}
+	messages[lastIdx] = updatedMsg
+	return messages
+}
+
+// claudeModelRejectsAssistantPrefill reports whether a Claude model family
+// disallows trailing assistant prefill in its conversation history.
+func claudeModelRejectsAssistantPrefill(modelName string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	for _, family := range []string{"fable", "opus-5", "sonnet-4-6"} {
+		if strings.Contains(normalized, family) {
+			return true
+		}
+	}
+	return false
 }
 
 // responsesSystemUnsupportedBlock represents a system-level content part that
@@ -925,11 +1091,76 @@ func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
 }
 
 func unwrapCustomToolInput(arguments string) string {
-	if v := gjson.Get(arguments, "input"); v.Exists() {
+	trimmed := strings.TrimSpace(arguments)
+	if v := gjson.Get(trimmed, "input"); v.Exists() {
 		if v.Type == gjson.String {
 			return v.String()
 		}
 		return v.Raw
+	}
+	idx := strings.Index(trimmed, `"input"`)
+	if idx >= 0 {
+		rest := strings.TrimSpace(trimmed[idx+7:])
+		if strings.HasPrefix(rest, ":") {
+			rest = strings.TrimSpace(rest[1:])
+			if strings.HasPrefix(rest, `"`) {
+				content := rest[1:]
+				var unescaped strings.Builder
+				inEscape := false
+				for i := 0; i < len(content); i++ {
+					c := content[i]
+					if inEscape {
+						switch c {
+						case '"', '\\', '/':
+							unescaped.WriteByte(c)
+						case 'b':
+							unescaped.WriteByte('\b')
+						case 'f':
+							unescaped.WriteByte('\f')
+						case 'n':
+							unescaped.WriteByte('\n')
+						case 'r':
+							unescaped.WriteByte('\r')
+						case 't':
+							unescaped.WriteByte('\t')
+						case 'u':
+							if i+4 < len(content) {
+								if r, err := strconv.ParseUint(content[i+1:i+5], 16, 16); err == nil {
+									if utf16.IsSurrogate(rune(r)) && i+10 < len(content) && content[i+5:i+7] == `\u` {
+										if r2, err2 := strconv.ParseUint(content[i+7:i+11], 16, 16); err2 == nil {
+											unescaped.WriteRune(utf16.DecodeRune(rune(r), rune(r2)))
+											i += 10
+											inEscape = false
+											continue
+										}
+									}
+									unescaped.WriteRune(rune(r))
+									i += 4
+									inEscape = false
+									continue
+								}
+							}
+							unescaped.WriteByte('\\')
+							unescaped.WriteByte('u')
+						default:
+							unescaped.WriteByte('\\')
+							unescaped.WriteByte(c)
+						}
+						inEscape = false
+					} else if c == '\\' {
+						inEscape = true
+					} else if c == '"' {
+						break
+					} else {
+						unescaped.WriteByte(c)
+					}
+				}
+				if inEscape {
+					unescaped.WriteByte('\\')
+				}
+				return unescaped.String()
+			}
+		}
 	}
 	return arguments
 }
@@ -1064,4 +1295,57 @@ func isUnsupportedOpenAIBuiltinToolType(toolType string) bool {
 	default:
 		return false
 	}
+}
+
+// normalizeCodexAgentMessages rewrites Codex multi-agent v2 "agent_message"
+// input items into plain user "message" items so the Claude translator does
+// not drop the delegated task text. Encrypted content parts are surfaced as
+// input_text, mirroring the multi-agent v2 optimizer used for other upstreams.
+func normalizeCodexAgentMessages(payload []byte) []byte {
+	input := gjson.GetBytes(payload, "input")
+	if !input.IsArray() {
+		return payload
+	}
+	updated := payload
+	changed := false
+	for itemIndex, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) != "agent_message" {
+			continue
+		}
+		itemPath := "input." + strconv.Itoa(itemIndex)
+		var errSet error
+		if content := item.Get("content"); content.IsArray() {
+			for partIndex, part := range content.Array() {
+				if strings.TrimSpace(part.Get("type").String()) != "encrypted_content" {
+					continue
+				}
+				enc := part.Get("encrypted_content")
+				if enc.Type != gjson.String {
+					continue
+				}
+				partPath := itemPath + ".content." + strconv.Itoa(partIndex)
+				if updated, errSet = sjson.SetBytes(updated, partPath+".type", "input_text"); errSet != nil {
+					return payload
+				}
+				if updated, errSet = sjson.SetBytes(updated, partPath+".text", enc.String()); errSet != nil {
+					return payload
+				}
+				var errDelete error
+				if updated, errDelete = sjson.DeleteBytes(updated, partPath+".encrypted_content"); errDelete != nil {
+					return payload
+				}
+			}
+		}
+		if updated, errSet = sjson.SetBytes(updated, itemPath+".role", "user"); errSet != nil {
+			return payload
+		}
+		if updated, errSet = sjson.SetBytes(updated, itemPath+".type", "message"); errSet != nil {
+			return payload
+		}
+		changed = true
+	}
+	if !changed {
+		return payload
+	}
+	return updated
 }

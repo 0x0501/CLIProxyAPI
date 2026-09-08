@@ -72,6 +72,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	body = normalizeCodexParallelToolCalls(body, opts.Headers)
+	body = helps.NormalizeCodexToolSchemas(body)
 	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, baseModel)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -107,7 +108,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
+	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -157,6 +158,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}
 
+	sawOutputDelta := false
 	if buffering {
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
@@ -171,6 +173,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
+				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
@@ -193,20 +196,33 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					bootstrapTerminalErr = streamErr
 					break
 				}
+				if helps.HasMeaningfulCodexOutputDelta(data) {
+					sawOutputDelta = true
+				}
+				if helps.IsCodexTerminalEmptyIncomplete(data, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
+					closeBootstrapBody()
+					streamErr := newCodexEmptyIncompleteStreamError()
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					return nil, streamErr
+				}
 				if isCodexHandshakeMetadataEvent(eventType) {
 					isHandshake = true
 				}
 				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed", "response.incomplete":
+				case "response.completed", "response.incomplete", "response.done":
 					terminalSuccess = true
+					data = normalizeCodexWebsocketCompletion(data)
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
+					} else {
+						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					if eventType == "response.completed" {
+					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}
 					translatedLine = append([]byte("data: "), data...)
@@ -297,6 +313,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			} else if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
+				observeCodexTokenEvent(reporter, data)
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
@@ -317,17 +334,33 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
+				if helps.HasMeaningfulCodexOutputDelta(data) {
+					sawOutputDelta = true
+				}
+				if helps.IsCodexTerminalEmptyIncomplete(data, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
+					streamErr := newCodexEmptyIncompleteStreamError()
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed", "response.incomplete":
+				case "response.completed", "response.incomplete", "response.done":
 					terminalSuccess = true
+					data = normalizeCodexWebsocketCompletion(data)
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
+					} else {
+						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					if eventType == "response.completed" {
+					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}
 					translatedLine = append([]byte("data: "), data...)

@@ -78,6 +78,64 @@ func TestXAIWebsocketsRequiredUpstreamRejectsCompactionHTTPFallback(t *testing.T
 	}
 }
 
+func TestXAIWebsocketMissingRequiredSessionDoesNotMarkUpstreamAttempt(t *testing.T) {
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-required-session",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"api_key": "xai-key",
+		},
+	}
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(
+		cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background()),
+	)
+	_, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "grok-4",
+		Payload: []byte(`{"model":"grok-4","previous_response_id":"resp-1","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "missing-xai-session",
+		},
+	})
+	if !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errExecute) {
+		t.Fatalf("ExecuteStream() error = %T %v, want replay-required", errExecute, errExecute)
+	}
+	if cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("missing retained websocket connection was marked as an upstream attempt")
+	}
+}
+
+func TestXAIWebsocketSuccessfulHandshakeDoesNotMarkRequestAttempt(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
+	conn, closer, resp, errDial := exec.dialXAIWebsocket(ctx, &cliproxyauth.Auth{}, strings.Replace(server.URL, "http", "ws", 1), http.Header{})
+	if errDial != nil || conn == nil {
+		t.Fatalf("dialXAIWebsocket() = (%p, %v), want successful connection", conn, errDial)
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	defer func() { _ = closer.Close() }()
+	if cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("successful handshake was marked before an upstream request was sent")
+	}
+}
+
 func TestMapXAIWebsocketWriteErrorStopsRetryForMessageTooBig(t *testing.T) {
 	networkWriteErr := errors.New("write: broken pipe")
 	tests := []struct {
@@ -261,11 +319,16 @@ func TestXAIWebsocketsExecuteStreamSendsResponseCreateWithPreviousResponseID(t *
 			cliproxyexecutor.ExecutionSessionMetadataKey: "execution-session-1",
 		},
 	}
-	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(
+		cliproxyexecutor.WithDownstreamWebsocket(context.Background()),
+	)
 
 	result, err := exec.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if !cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("websocket write did not mark an upstream attempt")
 	}
 
 	select {
@@ -1557,9 +1620,13 @@ func TestXAIWebsocketsExecuteStreamHandshakeFreeUsageExhaustedSetsRetryAfter(t *
 		ResponseFormat: sdktranslator.FormatOpenAIResponse,
 	}
 
-	_, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
+	_, err := exec.ExecuteStream(ctx, auth, req, opts)
 	if err == nil {
 		t.Fatal("ExecuteStream() error = nil, want handshake rejection")
+	}
+	if !cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("429 websocket handshake was not marked as an upstream attempt")
 	}
 	status, ok := err.(interface{ StatusCode() int })
 	if !ok || status.StatusCode() != http.StatusTooManyRequests {
@@ -1720,5 +1787,135 @@ func TestXAIWebsocketsExecuteStreamStopsOnBareErrorPayload(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for bare upstream error")
+	}
+}
+
+func TestXAIWebsocketsCompactionTriggerFreshSessionFallback(t *testing.T) {
+	capturedCompactPayload := make(chan []byte, 4)
+	compactResponse := []byte(`{"id":"resp_compact_fresh","output":[{"id":"cmp-1","type":"compaction","encrypted_content":"ZW5jcnlwdGVk"}]}`)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses/compact":
+			body, errRead := io.ReadAll(r.Body)
+			if errRead != nil {
+				t.Errorf("read compact body: %v", errRead)
+				return
+			}
+			capturedCompactPayload <- bytes.Clone(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(compactResponse)
+		default:
+			t.Errorf("path = %q, want /responses/compact", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec.idStore = &xaiWebsocketIDStateStore{sessions: make(map[string]*xaiWebsocketIDState)}
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-auth-compaction-fresh",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	// 1. Fresh session with payload input containing history + compaction_trigger (and a previous_response_id that should be dropped)
+	optsInput := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "xai-compaction-fresh-input-session",
+		},
+	}
+	compactResult, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","stream":true,"previous_response_id":"resp-should-be-dropped","input":[{"type":"message","id":"msg-fresh-1","role":"user","content":"hello"},{"type":"compaction_trigger"}]}`),
+	}, optsInput)
+	if err != nil {
+		t.Fatalf("ExecuteStream fresh session with payload input error: %v", err)
+	}
+	for chunk := range compactResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("compact stream chunk error = %v", chunk.Err)
+		}
+	}
+	select {
+	case payload := <-capturedCompactPayload:
+		if xaiInputHasItemType(payload, "compaction_trigger") {
+			t.Fatalf("compaction_trigger reached xai compact body: %s", payload)
+		}
+		input := gjson.GetBytes(payload, "input")
+		if !input.IsArray() || len(input.Array()) != 1 {
+			t.Fatalf("compact input = %s, want 1 item", input.Raw)
+		}
+		if got := input.Array()[0].Get("id").String(); got != "msg-fresh-1" {
+			t.Fatalf("compact input[0].id = %q, want msg-fresh-1; payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "" {
+			t.Fatalf("compact previous_response_id = %q, want empty; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for compact HTTP payload")
+	}
+
+	// 2. Fresh session with previous_response_id and trigger-only input
+	optsPrev := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "xai-compaction-fresh-prev-session",
+		},
+	}
+	compactResultPrev, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","stream":true,"previous_response_id":"resp-prev-123","input":[{"type":"compaction_trigger"}]}`),
+	}, optsPrev)
+	if err != nil {
+		t.Fatalf("ExecuteStream fresh session with previous_response_id error: %v", err)
+	}
+	for chunk := range compactResultPrev.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("compact stream chunk error = %v", chunk.Err)
+		}
+	}
+	select {
+	case payload := <-capturedCompactPayload:
+		if xaiInputHasItemType(payload, "compaction_trigger") {
+			t.Fatalf("compaction_trigger reached xai compact body: %s", payload)
+		}
+		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "resp-prev-123" {
+			t.Fatalf("compact previous_response_id = %q, want resp-prev-123; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for compact HTTP payload")
+	}
+
+	// 3. Fresh session with only compaction_trigger (no messages, no previous_response_id) returns 400
+	optsEmpty := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "xai-compaction-fresh-empty-session",
+		},
+	}
+	_, errEmpty := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","stream":true,"input":[{"type":"compaction_trigger"}]}`),
+	}, optsEmpty)
+	if errEmpty == nil || !strings.Contains(errEmpty.Error(), "xai websocket compaction context is empty") {
+		t.Fatalf("ExecuteStream empty context error = %v, want compaction context is empty", errEmpty)
+	}
+	statusError, okStatus := errEmpty.(interface{ StatusCode() int })
+	if !okStatus || statusError.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("error status = %v, want %d", errEmpty, http.StatusBadRequest)
 	}
 }

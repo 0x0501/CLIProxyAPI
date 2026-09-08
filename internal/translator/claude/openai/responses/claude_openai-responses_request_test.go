@@ -42,6 +42,63 @@ func TestConvertOpenAIResponsesRequestToClaude_SanitizesToolCallIDsForClaude(t *
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_FableMaxTokens(t *testing.T) {
+	t.Run("defaults to 64k", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaude(
+			"claude-fable-5-1",
+			[]byte(`{"model":"claude-fable-5-1","input":"hello"}`),
+			true,
+		)
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 64000 {
+			t.Fatalf("max_tokens = %d, want %d; output=%s", got, 64000, out)
+		}
+	})
+
+	t.Run("preserves explicit 128k limit", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaude(
+			"claude-fable-5-1",
+			[]byte(`{"model":"claude-fable-5-1","max_output_tokens":128000,"input":"hello"}`),
+			true,
+		)
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 128000 {
+			t.Fatalf("max_tokens = %d, want 128000; output=%s", got, out)
+		}
+	})
+
+	t.Run("does not exceed registered model maximum", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaude(
+			"claude-3-5-haiku-20241022",
+			[]byte(`{"model":"claude-3-5-haiku-20241022","input":"hello"}`),
+			true,
+		)
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 8192 {
+			t.Fatalf("max_tokens = %d, want 8192; output=%s", got, out)
+		}
+	})
+
+	t.Run("clamps explicit limit exceeding registered model maximum", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaude(
+			"claude-3-5-haiku-20241022",
+			[]byte(`{"model":"claude-3-5-haiku-20241022","max_output_tokens":128000,"input":"hello"}`),
+			true,
+		)
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 8192 {
+			t.Fatalf("max_tokens = %d, want 8192; output=%s", got, out)
+		}
+	})
+
+	t.Run("null max_output_tokens retains default 64k", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaude(
+			"claude-fable-5-1",
+			[]byte(`{"model":"claude-fable-5-1","max_output_tokens":null,"input":"hello"}`),
+			true,
+		)
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 64000 {
+			t.Fatalf("max_tokens = %d, want 64000; output=%s", got, out)
+		}
+	})
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_ReasoningItemToThinkingBlock(t *testing.T) {
 	rawSignature, expectedSignature := testClaudeResponsesThinkingSignature(t)
 	raw := []byte(`{
@@ -942,13 +999,18 @@ func TestSplitResponsesQualifiedFunctionCallFromAdditionalTools(t *testing.T) {
 
 func testClaudeResponsesThinkingSignature(t *testing.T) (string, string) {
 	t.Helper()
+	return testClaudeResponsesThinkingSignatureForModel(t, "claude-sonnet-4-6")
+}
+
+func testClaudeResponsesThinkingSignatureForModel(t *testing.T, model string) (string, string) {
+	t.Helper()
 	channelBlock := []byte{}
 	channelBlock = protowire.AppendTag(channelBlock, 1, protowire.VarintType)
 	channelBlock = protowire.AppendVarint(channelBlock, 12)
 	channelBlock = protowire.AppendTag(channelBlock, 2, protowire.VarintType)
 	channelBlock = protowire.AppendVarint(channelBlock, 2)
 	channelBlock = protowire.AppendTag(channelBlock, 6, protowire.BytesType)
-	channelBlock = protowire.AppendString(channelBlock, "claude-sonnet-4-6")
+	channelBlock = protowire.AppendString(channelBlock, model)
 
 	container := []byte{}
 	container = protowire.AppendTag(container, 1, protowire.BytesType)
@@ -1021,7 +1083,7 @@ func TestConvertOpenAIResponsesRequestToClaude_SystemLevelInputsBecomeSeparateSy
 		]
 	}`
 
-	result := ConvertOpenAIResponsesRequestToClaude("claude-opus-5", []byte(inputJSON), false)
+	result := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
 	root := gjson.ParseBytes(result)
 
 	system := root.Get("system").Array()
@@ -1451,4 +1513,385 @@ func TestConvertOpenAIResponsesRequestToClaude_DifferentUserContentWithSameSyste
 	if idA == idB {
 		t.Fatalf("different user questions with same system prompt produced identical metadata.user_id: %q", idA)
 	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_FableStripsTrailingAssistantPrefill(t *testing.T) {
+	raw := []byte(`{
+		"model": "claude-fable-5",
+		"input": [
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+			{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "progress update"}]}
+		]
+	}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-fable-5", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message after stripping trailing assistant prefill, got %d: %s", len(messages), string(out))
+	}
+	if got := messages[0].Get("role").String(); got != "user" {
+		t.Fatalf("expected final message role = %q, got %q", "user", got)
+	}
+	if got := messages[0].Get("content").String(); got != "hello" {
+		t.Fatalf("expected content = %q, got %q", "hello", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_FableOnlyAssistantMessageYieldsFallbackUser(t *testing.T) {
+	raw := []byte(`{
+		"model": "claude-fable-5",
+		"input": [
+			{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "orphan progress"}]}
+		]
+	}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-fable-5", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 fallback user message, got %d: %s", len(messages), string(out))
+	}
+	if got := messages[0].Get("role").String(); got != "user" {
+		t.Fatalf("expected role = user, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_UnsupportedPrefillModelsStripTrailingAssistant(t *testing.T) {
+	unsupportedModels := []string{
+		"claude-fable-5",
+		"claude-opus-5",
+		"claude-sonnet-4-6",
+	}
+	for _, model := range unsupportedModels {
+		t.Run(model, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"model": %q,
+				"input": [
+					{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+					{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "progress update"}]}
+				]
+			}`, model))
+			out := ConvertOpenAIResponsesRequestToClaude(model, raw, false)
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != 1 {
+				t.Fatalf("expected 1 message after stripping trailing assistant prefill for model %s, got %d: %s", model, len(messages), string(out))
+			}
+			if got := messages[0].Get("role").String(); got != "user" {
+				t.Fatalf("expected final message role = %q, got %q", "user", got)
+			}
+			if got := messages[0].Get("content").String(); got != "hello" {
+				t.Fatalf("expected content = %q, got %q", "hello", got)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_SupportedPrefillModelsPreserveAssistantPrefill(t *testing.T) {
+	supportedModels := []string{
+		"claude-sonnet-4-5",
+		"claude-haiku-4-5",
+	}
+	for _, model := range supportedModels {
+		t.Run(model, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"model": %q,
+				"input": [
+					{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+					{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prefill text"}]}
+				]
+			}`, model))
+			out := ConvertOpenAIResponsesRequestToClaude(model, raw, false)
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != 2 {
+				t.Fatalf("expected 2 messages preserving assistant prefill for model %s, got %d: %s", model, len(messages), string(out))
+			}
+			if got := messages[1].Get("role").String(); got != "assistant" {
+				t.Fatalf("expected second message role = assistant, got %q", got)
+			}
+			if got := messages[1].Get("content").String(); got != "prefill text" {
+				t.Fatalf("expected content = %q, got %q", "prefill text", got)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeWithCompat_FablePreservesAssistantPrefill(t *testing.T) {
+	raw := []byte(`{
+		"model": "claude-fable-5",
+		"input": [
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+			{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prefill text"}]}
+		]
+	}`)
+	out := ConvertOpenAIResponsesRequestToClaudeWithCompat("claude-fable-5", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages in compat mode, got %d: %s", len(messages), string(out))
+	}
+	if got := messages[1].Get("role").String(); got != "assistant" {
+		t.Fatalf("expected second message role = assistant, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_StripsTrailingThinkingBlocksFromAssistant(t *testing.T) {
+	rawSignature, _ := testClaudeResponsesThinkingSignature(t)
+
+	t.Run("user_then_reasoning_drops_trailing_assistant_message", func(t *testing.T) {
+		raw := []byte(fmt.Sprintf(`{
+			"model": "claude-haiku-4-5-20251001",
+			"input": [
+				{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+				{"type": "reasoning", "encrypted_content": %q, "summary": [{"type": "summary_text", "text": "thought"}]}
+			]
+		}`, rawSignature))
+		out := ConvertOpenAIResponsesRequestToClaude("claude-haiku-4-5-20251001", raw, false)
+		messages := gjson.GetBytes(out, "messages").Array()
+		if len(messages) != 1 {
+			t.Fatalf("expected 1 message (user only) after stripping trailing thinking, got %d: %s", len(messages), string(out))
+		}
+		if got := messages[0].Get("role").String(); got != "user" {
+			t.Fatalf("expected role = user, got %q", got)
+		}
+		if got := messages[0].Get("content").String(); got != "hello" {
+			t.Fatalf("expected user content = hello, got %q", got)
+		}
+	})
+
+	t.Run("user_assistant_text_then_reasoning_strips_trailing_thinking_keeps_assistant_text", func(t *testing.T) {
+		raw := []byte(fmt.Sprintf(`{
+			"model": "claude-haiku-4-5-20251001",
+			"input": [
+				{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+				{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prefill text"}]},
+				{"type": "reasoning", "encrypted_content": %q, "summary": [{"type": "summary_text", "text": "thought"}]}
+			]
+		}`, rawSignature))
+		out := ConvertOpenAIResponsesRequestToClaude("claude-haiku-4-5-20251001", raw, false)
+		messages := gjson.GetBytes(out, "messages").Array()
+		if len(messages) != 2 {
+			t.Fatalf("expected 2 messages (user + assistant text), got %d: %s", len(messages), string(out))
+		}
+		if got := messages[1].Get("role").String(); got != "assistant" {
+			t.Fatalf("expected second message role = assistant, got %q", got)
+		}
+		if got := messages[1].Get("content").String(); got != "prefill text" {
+			t.Fatalf("expected assistant content = prefill text, got %q (raw: %s)", got, messages[1].Get("content").Raw)
+		}
+	})
+
+	t.Run("trailing_redacted_thinking_is_stripped", func(t *testing.T) {
+		raw := []byte(fmt.Sprintf(`{
+			"model": "claude-haiku-4-5-20251001",
+			"input": [
+				{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+				{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prefill text"}]},
+				{"type": "reasoning", "encrypted_content": %q, "summary": []},
+				{"type": "reasoning", "encrypted_content": %q, "summary": []}
+			]
+		}`, rawSignature, ClaudeResponsesRedactedThinkingPrefix+"redacted-data"))
+		out := ConvertOpenAIResponsesRequestToClaude("claude-haiku-4-5-20251001", raw, false)
+		messages := gjson.GetBytes(out, "messages").Array()
+		if len(messages) != 2 {
+			t.Fatalf("expected 2 messages (user + assistant text), got %d: %s", len(messages), string(out))
+		}
+		if got := messages[1].Get("content").String(); got != "prefill text" {
+			t.Fatalf("expected assistant content = prefill text, got %q (raw: %s)", got, messages[1].Get("content").Raw)
+		}
+	})
+
+	t.Run("only_reasoning_item_yields_fallback_user_message", func(t *testing.T) {
+		raw := []byte(fmt.Sprintf(`{
+			"model": "claude-haiku-4-5-20251001",
+			"input": [
+				{"type": "reasoning", "encrypted_content": %q, "summary": [{"type": "summary_text", "text": "thought"}]}
+			]
+		}`, rawSignature))
+		out := ConvertOpenAIResponsesRequestToClaude("claude-haiku-4-5-20251001", raw, false)
+		messages := gjson.GetBytes(out, "messages").Array()
+		if len(messages) != 1 {
+			t.Fatalf("expected 1 message (fallback user), got %d: %s", len(messages), string(out))
+		}
+		if got := messages[0].Get("role").String(); got != "user" {
+			t.Fatalf("expected fallback role = user, got %q", got)
+		}
+	})
+
+	t.Run("compat_mode_preserves_trailing_thinking", func(t *testing.T) {
+		raw := []byte(fmt.Sprintf(`{
+			"model": "claude-haiku-4-5-20251001",
+			"input": [
+				{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+				{"type": "reasoning", "encrypted_content": %q, "summary": [{"type": "summary_text", "text": "thought"}]}
+			]
+		}`, rawSignature))
+		out := ConvertOpenAIResponsesRequestToClaudeWithCompat("claude-haiku-4-5-20251001", raw, false)
+		messages := gjson.GetBytes(out, "messages").Array()
+		if len(messages) != 2 {
+			t.Fatalf("expected 2 messages in compat mode, got %d: %s", len(messages), string(out))
+		}
+	})
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeKeepsAgentMessageText(t *testing.T) {
+	in := []byte(`{"model":"claude-fable-5-1","input":[
+		{"type":"agent_message","content":[{"type":"input_text","text":"do X"}]},
+		{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"secret task"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"plain"}]}]}`)
+
+	for _, tc := range []struct {
+		name string
+		fn   func(string, []byte, bool) []byte
+	}{
+		{"standard", ConvertOpenAIResponsesRequestToClaude},
+		{"compat", ConvertOpenAIResponsesRequestToClaudeWithCompat},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := tc.fn("claude-fable-5-1", in, false)
+			root := gjson.ParseBytes(out)
+			messages := root.Get("messages").Array()
+			if len(messages) != 1 {
+				t.Fatalf("messages count = %d, want 1; output=%s", len(messages), string(out))
+			}
+			if got := messages[0].Get("role").String(); got != "user" {
+				t.Fatalf("messages[0].role = %q, want user", got)
+			}
+			parts := messages[0].Get("content").Array()
+			if len(parts) != 3 {
+				t.Fatalf("parts count = %d, want 3; output=%s", len(parts), string(out))
+			}
+			wantTexts := []string{"do X", "secret task", "plain"}
+			for i, want := range wantTexts {
+				if got := parts[i].Get("text").String(); got != want {
+					t.Errorf("parts[%d].text = %q, want %q", i, got, want)
+				}
+			}
+		})
+	}
+
+	t.Run("mixed_content_in_single_agent_message", func(t *testing.T) {
+		mixedIn := []byte(`{"model":"claude-fable-5-1","input":[
+			{"type":"agent_message","content":[
+				{"type":"input_text","text":"step 1"},
+				{"type":"encrypted_content","encrypted_content":"step 2"}
+			]}
+		]}`)
+		out := ConvertOpenAIResponsesRequestToClaude("claude-fable-5-1", mixedIn, false)
+		root := gjson.ParseBytes(out)
+		parts := root.Get("messages.0.content").Array()
+		if len(parts) != 2 {
+			t.Fatalf("parts count = %d, want 2; output=%s", len(parts), string(out))
+		}
+		if got := parts[0].Get("text").String(); got != "step 1" {
+			t.Errorf("parts[0].text = %q, want step 1", got)
+		}
+		if got := parts[1].Get("text").String(); got != "step 2" {
+			t.Errorf("parts[1].text = %q, want step 2", got)
+		}
+	})
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_TextFormatStructuredOutput(t *testing.T) {
+	t.Run("json_schema", func(t *testing.T) {
+		input := []byte(`{
+			"model": "claude-sonnet-4-6",
+			"input": "Extract facts.",
+			"text": {
+				"format": {
+					"type": "json_schema",
+					"name": "extracted_facts",
+					"schema": {
+						"type": "object",
+						"properties": {
+							"facts": {
+								"type": "array",
+								"items": {"type": "string"}
+							}
+						},
+						"required": ["facts"]
+					}
+				}
+			}
+		}`)
+		out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", input, false)
+		system := gjson.GetBytes(out, "system")
+		if !system.Exists() || len(system.Array()) == 0 {
+			t.Fatalf("system blocks missing. Output: %s", string(out))
+		}
+		found := false
+		for _, block := range system.Array() {
+			if strings.Contains(block.Get("text").String(), "facts") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected structured schema instruction in system prompt. Output: %s", string(out))
+		}
+	})
+
+	t.Run("json_object", func(t *testing.T) {
+		input := []byte(`{
+			"model": "claude-sonnet-4-6",
+			"input": "Return JSON.",
+			"text": {
+				"format": {
+					"type": "json_object"
+				}
+			}
+		}`)
+		out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", input, false)
+		system := gjson.GetBytes(out, "system")
+		if !system.Exists() || len(system.Array()) == 0 {
+			t.Fatalf("system blocks missing. Output: %s", string(out))
+		}
+		found := false
+		for _, block := range system.Array() {
+			if strings.Contains(block.Get("text").String(), "JSON object") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected JSON object instruction in system prompt. Output: %s", string(out))
+		}
+	})
+
+	t.Run("preserves_existing_instructions_and_precedence", func(t *testing.T) {
+		input := []byte(`{
+			"model": "claude-sonnet-4-6",
+			"instructions": "Be concise.",
+			"input": "Extract facts.",
+			"text": {
+				"format": {
+					"type": "json_schema",
+					"name": "winning_schema",
+					"description": "Primary facts",
+					"schema": {"type": "object", "properties": {"item": {"type": "string"}}}
+				}
+			},
+			"response_format": {
+				"type": "json_object"
+			}
+		}`)
+		out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", input, false)
+		system := gjson.GetBytes(out, "system")
+		if !system.Exists() || len(system.Array()) < 2 {
+			t.Fatalf("expected at least 2 system blocks. Output: %s", string(out))
+		}
+		hasInstructions := false
+		hasWinningSchema := false
+		hasFallbackObject := false
+		for _, block := range system.Array() {
+			text := block.Get("text").String()
+			if strings.Contains(text, "Be concise.") {
+				hasInstructions = true
+			}
+			if strings.Contains(text, "winning_schema") && strings.Contains(text, "Primary facts") && strings.Contains(text, "item") {
+				hasWinningSchema = true
+			}
+			if strings.Contains(text, "valid JSON object") {
+				hasFallbackObject = true
+			}
+		}
+		if !hasInstructions || !hasWinningSchema || hasFallbackObject {
+			t.Fatalf("expected instructions and winning schema without fallback. Output: %s", string(out))
+		}
+	})
 }

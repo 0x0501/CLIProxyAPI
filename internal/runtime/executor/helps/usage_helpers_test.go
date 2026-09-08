@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -579,7 +582,8 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 
 func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	delay := 40 * time.Millisecond
-	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 	client := reporter.TrackHTTPClient(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			time.Sleep(delay)
@@ -593,7 +597,7 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 		}),
 	})
 
-	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/chat/completions", strings.NewReader("{}"))
+	req, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/v1/chat/completions", strings.NewReader("{}"))
 	if errNewRequest != nil {
 		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
 	}
@@ -609,6 +613,136 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	}
 	if got := reporter.ttftDuration(); got < delay {
 		t.Fatalf("ttft = %v, want >= %v", got, delay)
+	}
+	if !cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("HTTP RoundTrip did not mark an upstream attempt")
+	}
+}
+
+func TestUsageReporterTrackHTTPClientRoundTripOnly_DoesNotTriggerOnBodyRead(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	client := reporter.TrackHTTPClientRoundTripOnly(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			time.Sleep(10 * time.Millisecond)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\n")),
+				Request:    req,
+			}, nil
+		}),
+	})
+
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/responses", strings.NewReader("{}"))
+	if errNewRequest != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	bodyBytes, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close error = %v", errClose)
+	}
+
+	// 1. Plain body reading must NOT set TTFT
+	if reporter.IsTTFTSet() {
+		t.Fatalf("TrackHTTPClientRoundTripOnly must not set TTFT on plain body read")
+	}
+
+	// 2. Observing metadata event records fallback, but does NOT set effective TTFT
+	ObserveResponsesTokenEvent(reporter, bodyBytes)
+	if reporter.IsTTFTSet() {
+		t.Fatalf("Observing metadata event must not set effective TTFT")
+	}
+	if reporter.ttftDuration() <= 0 {
+		t.Fatalf("Fallback TTFT should be recorded and > 0, got %v", reporter.ttftDuration())
+	}
+
+	// 3. Observing substantive token event sets effective TTFT
+	ObserveResponsesTokenEvent(reporter, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
+	if !reporter.IsTTFTSet() {
+		t.Fatalf("Observing token event must set effective TTFT")
+	}
+}
+
+func TestUsageReporterTrackHTTPClientRoundTripOnly_ErrorResponseRecordsFirstPacketFallback(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	client := reporter.TrackHTTPClientRoundTripOnly(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"rate limit"}}`)),
+				Request:    req,
+			}, nil
+		}),
+	})
+
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/responses", strings.NewReader("{}"))
+	if errNewRequest != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	_, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	_ = resp.Body.Close()
+
+	if reporter.IsTTFTSet() {
+		t.Fatalf("error response read must not set substantive token TTFT")
+	}
+	if !reporter.IsFirstPacketSet() {
+		t.Fatalf("error response read must record first packet set fallback")
+	}
+}
+
+func TestUsageReporterObserveTokenEvent_FastPathNonTokenAndToken(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	reporter.StartResponseTTFT()
+
+	// 1. Initial state
+	if reporter.IsTTFTSet() {
+		t.Fatalf("expected IsTTFTSet() == false initially")
+	}
+
+	// 2. First non-token event records firstPacketDuration, but does not mark TTFT set
+	reporter.ObserveTokenEvent(false)
+	if reporter.IsTTFTSet() {
+		t.Fatalf("ObserveTokenEvent(false) must not set TTFT")
+	}
+	if !reporter.IsFirstPacketSet() {
+		t.Fatalf("expected IsFirstPacketSet() == true")
+	}
+	firstPacketDuration := reporter.firstPacketDuration
+
+	// 3. Subsequent non-token event is a fast-path return and does not alter firstPacketDuration
+	reporter.ObserveTokenEvent(false)
+	if reporter.firstPacketDuration != firstPacketDuration {
+		t.Fatalf("subsequent ObserveTokenEvent(false) must preserve original firstPacketDuration")
+	}
+
+	// 4. Substantive token event sets effective TTFT
+	reporter.ObserveTokenEvent(true)
+	if !reporter.IsTTFTSet() {
+		t.Fatalf("ObserveTokenEvent(true) must set IsTTFTSet() == true")
+	}
+	tokenTTFT := reporter.ttft
+
+	// 5. Subsequent token event is a fast-path return and does not alter TTFT
+	reporter.ObserveTokenEvent(true)
+	if reporter.ttft != tokenTTFT {
+		t.Fatalf("subsequent ObserveTokenEvent(true) must not alter already recorded TTFT")
 	}
 }
 
@@ -679,6 +813,35 @@ func TestUsageReporterBuildRecordIncludesGenerateFalse(t *testing.T) {
 	}
 }
 
+func TestUsageReporterBuildRecordDefaultsStreamFalse(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Stream {
+		t.Fatalf("stream = %v, want false", record.Stream)
+	}
+}
+
+func TestUsageReporterBuildRecordIncludesStreamTrue(t *testing.T) {
+	ctx := usage.WithStream(context.Background(), true)
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if !record.Stream {
+		t.Fatalf("stream = %v, want true", record.Stream)
+	}
+}
+
+func TestUsageReporterSetStream(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	reporter.SetStream(true)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if !record.Stream {
+		t.Fatalf("stream = %v, want true", record.Stream)
+	}
+}
+
 func TestUsageReporterSetTranslatedReasoningEffortPreservesClientServiceTier(t *testing.T) {
 	ctx := usage.WithServiceTier(context.Background(), "auto")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
@@ -706,6 +869,50 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{CachedTokens: 2}); !ok {
 		t.Fatalf("expected non-zero cached token usage to be recorded")
+	}
+}
+
+type usageResponseBodyError struct {
+	status  int
+	message string
+	body    []byte
+}
+
+func (e usageResponseBodyError) Error() string {
+	return e.message
+}
+
+func (e usageResponseBodyError) StatusCode() int {
+	return e.status
+}
+
+func (e usageResponseBodyError) ResponseBody() []byte {
+	return e.body
+}
+
+func TestFailFromErrorsPrefersResponseBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "original response body", body: []byte(" \n{\"error\":\"upstream rejected request\"}\r\n")},
+		{name: "empty response body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errExecute := fmt.Errorf("execute failed: %w", usageResponseBodyError{
+				status:  http.StatusUnauthorized,
+				message: "generic upstream error",
+				body:    tc.body,
+			})
+			failure := failFromErrors(errExecute)
+			wantBody := errExecute.Error()
+			if len(tc.body) > 0 {
+				wantBody = string(tc.body)
+			}
+			if failure.StatusCode != http.StatusUnauthorized || failure.Body != wantBody {
+				t.Fatalf("failure = %#v, want status %d body %q", failure, http.StatusUnauthorized, wantBody)
+			}
+		})
 	}
 }
 
@@ -773,4 +980,55 @@ type TestUsageExecutor struct{}
 
 func (TestUsageExecutor) Identifier() string {
 	return "test-provider"
+}
+
+func TestUsageReporterPropagatesSessionHierarchy(t *testing.T) {
+	ctx := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "claude:sess-1:agent:sub-1",
+		ParentSessionID: "claude:sess-1",
+	})
+
+	reporter := NewUsageReporter(ctx, "claude", "claude-3-7-sonnet", nil)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record.SessionID != "claude:sess-1:agent:sub-1" || record.ParentSessionID != "claude:sess-1" {
+		t.Fatalf("record session hierarchy = (%q, %q), want (claude:sess-1:agent:sub-1, claude:sess-1)", record.SessionID, record.ParentSessionID)
+	}
+
+	// Test explicit override via SetSessionHierarchy
+	reporter.SetSessionHierarchy("override:child", "override:parent")
+	record2 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record2.SessionID != "override:child" || record2.ParentSessionID != "override:parent" {
+		t.Fatalf("overridden record session hierarchy = (%q, %q), want (override:child, override:parent)", record2.SessionID, record2.ParentSessionID)
+	}
+
+	// Test self-loop elimination in SetSessionHierarchy
+	reporter.SetSessionHierarchy("loop:node", "loop:node")
+	record3 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record3.SessionID != "loop:node" || record3.ParentSessionID != "" {
+		t.Fatalf("self loop record session hierarchy = (%q, %q), want (loop:node, empty)", record3.SessionID, record3.ParentSessionID)
+	}
+
+	// Test orphan parent elimination when sessionID is empty
+	reporter.SetSessionHierarchy("", "orphan:parent")
+	record4 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record4.SessionID != "" || record4.ParentSessionID != "" {
+		t.Fatalf("orphan parent record session hierarchy = (%q, %q), want empty both", record4.SessionID, record4.ParentSessionID)
+	}
+
+	// Test cross-prefix alias rejection (e.g. pck:* and conv:* are aliases, not parent-child)
+	ctxAlias := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "pck:prompt-key-123",
+		ParentSessionID: "conv:conv-456",
+	})
+	reporterAlias := NewUsageReporter(ctxAlias, "openai", "gpt-5.4", nil)
+	recordAlias := reporterAlias.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if recordAlias.SessionID != "pck:prompt-key-123" || recordAlias.ParentSessionID != "" {
+		t.Fatalf("cross prefix alias emitted as parent: (%q, %q), want (pck:prompt-key-123, empty)", recordAlias.SessionID, recordAlias.ParentSessionID)
+	}
+
+	reporterAlias.SetSessionHierarchy("pck:key-999", "conv:alias-888")
+	recordAlias2 := reporterAlias.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if recordAlias2.SessionID != "pck:key-999" || recordAlias2.ParentSessionID != "" {
+		t.Fatalf("SetSessionHierarchy cross prefix alias emitted as parent: (%q, %q), want (pck:key-999, empty)", recordAlias2.SessionID, recordAlias2.ParentSessionID)
+	}
 }
