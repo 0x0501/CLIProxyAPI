@@ -898,9 +898,18 @@ func TestBuildDialerHTTPSProxyCONNECT(t *testing.T) {
 	if mode != ModeProxy {
 		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
 	}
-	httpDialer, ok := dialer.(*httpConnectDialer)
+	// The Proof-pool loopback bypass (ADR 0039) wraps the proxied dialer, and
+	// the CONNECT behaviour under test belongs to the one inside. Dialing still
+	// goes through the wrapper below: it delegates to this same pointer, so the
+	// tlsConfig set here is the one the handshake uses, and a non-private target
+	// like target.example.com is not bypassed anyway.
+	inner := dialer
+	if bypass, wrapped := inner.(bypassDialer); wrapped {
+		inner = bypass.proxied
+	}
+	httpDialer, ok := inner.(*httpConnectDialer)
 	if !ok {
-		t.Fatalf("dialer type = %T, want *httpConnectDialer", dialer)
+		t.Fatalf("dialer type = %T, want *httpConnectDialer", inner)
 	}
 	certPool := x509.NewCertPool()
 	certPool.AddCert(proxyCert.Leaf)
