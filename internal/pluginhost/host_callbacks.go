@@ -129,6 +129,8 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostAuthGetRuntime(ctx, request)
 	case pluginabi.MethodHostAuthSave:
 		return h.callHostAuthSave(ctx, request)
+	case pluginabi.MethodHostAffinityLookup:
+		return h.callHostAffinityLookup(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}
@@ -324,6 +326,8 @@ func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, sk
 		Alt:                     req.Alt,
 		SkipInterceptorPluginID: skipPluginID,
 		SkipRouterPluginID:      skipPluginID,
+		ForcedProvider:          req.ForcedProvider,
+		AuthID:                  req.AuthID,
 	}
 }
 
