@@ -180,6 +180,32 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}
 
+	// drainAfterTerminal reads what the upstream still has to say after the
+	// terminal event, and throws it away.
+	//
+	// The client is already finished: response.completed is the last event it
+	// is given. What is left on the wire is the upstream's own terminator, and
+	// closing the body instead of reading it is a reader walking away
+	// mid-stream. Between this gateway and the upstream sits the Tokenswim
+	// relay, which is proxying the same bytes: a close there aborts its copy,
+	// and the session is filed `truncated` -- a complete answer recorded as a
+	// cut one, on every successful Codex stream.
+	//
+	// Bounded, because a stream that never ends must not pin this goroutine.
+	// The timer closes the body, which is what unblocks the read; the caller's
+	// own Close is then a no-op error that is already logged.
+	//
+	// Never before the client is released. This runs after close(out), on a
+	// goroutine nobody waits on, so it costs the request nothing.
+	drainAfterTerminal := func(scanner *bufio.Scanner) {
+		timer := time.AfterFunc(codexTerminalDrainBudget, func() {
+			_ = httpResp.Body.Close()
+		})
+		defer timer.Stop()
+		for scanner.Scan() {
+		}
+	}
+
 	sawOutputDelta := false
 	if buffering {
 		for scanner.Scan() {
@@ -342,18 +368,29 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 	}
 	if immediateTerminal {
-		closeBootstrapBody()
 		close(out)
+		// Same reason as the streaming goroutine's drain, and the same order:
+		// the client has its terminal event before this reads the tail the
+		// relay in front needs to see the stream end rather than a reader
+		// leaving mid-copy.
+		go func() {
+			drainAfterTerminal(scanner)
+			closeBootstrapBody()
+		}()
 		return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 	}
 
 	go func() {
-		defer close(out)
+		// Registered first so it runs last: the body outlives the drain, and
+		// the drain outlives the client. Reversing these would close the body
+		// under the drain, or hold the client open for the duration of it.
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
+		defer drainAfterTerminal(scanner)
+		defer close(out)
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)

@@ -494,6 +494,20 @@ const codexBootstrapMaxBufferedFrames = 48
 // materialised the frame by the time it is consulted.
 const codexBootstrapMaxBufferedBytes = 1 << 20
 
+// codexTerminalDrainBudget bounds the read that follows response.completed.
+//
+// What it is spending time on is bytes the client will never see: the
+// upstream's terminator, after the last event this gateway forwards. It is
+// read rather than abandoned because a reader that closes mid-stream aborts
+// the copy in the Tokenswim relay proxying the same bytes, and the session is
+// then filed `truncated` -- a whole answer recorded as a cut one.
+//
+// Two seconds, against an upstream that has already said everything: it ends
+// promptly or it is not going to. Nothing waits on this -- the client was
+// released before it started -- so the budget buys the relay a clean end
+// without costing the request anything.
+const codexTerminalDrainBudget = 2 * time.Second
+
 // isCodexBootstrapBufferableEvent reports whether a frame may be held back before the downstream
 // response headers are committed, i.e. whether nothing observable has happened yet.
 //
