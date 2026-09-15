@@ -227,14 +227,17 @@ func TestPipeStreamLogsDivergenceAndPrefersRaw(t *testing.T) {
 // by re-parsing the translated stream exactly as it did before ADR 0019. The
 // per-format expectations below are that fallback's known fidelity: responses
 // is lossless, chat recovers cache write only through the parser's alias entry,
-// and claude recovers cache write but still loses reasoning — which is why the
-// raw-capture test above is not merely re-asserting re-parse.
+// and claude now recovers both — which is why the raw-capture test above is not
+// merely re-asserting re-parse.
 //
-// Claude used to lose cache write here too, and this table said so. Upstream's
-// f804fb5f taught the openai->claude streaming translator to carry usage across
-// chunks (UsageCacheWriteTokens), so the fallback got better and the sentence
-// claiming claude "structurally cannot" carry it stopped being true. Measured,
-// not assumed: reasoning is still 0 through this path.
+// This table is a measurement of the translators, not a statement about them,
+// and each upstream sync has moved it. Claude used to lose cache write: f804fb5f
+// taught the openai->claude streaming translator to carry usage across chunks
+// (UsageCacheWriteTokens). Claude then still lost reasoning, and this comment
+// said so; the 2026-09 sync added setClaudeReasoningUsage to the codex->claude
+// response translator, which writes usage.output_tokens_details.thinking_tokens
+// — the first key parseClaudeUsageNode looks for — so the fallback recovers it.
+// Re-measure rather than assume when a sync turns this red.
 func TestPipeStreamFallsBackToTranslatedReparseWithoutRawRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -245,7 +248,7 @@ func TestPipeStreamFallsBackToTranslatedReparseWithoutRawRecord(t *testing.T) {
 	}{
 		{"responses", "openai-response", sdktranslator.FormatOpenAIResponse, 300, 10},
 		{"chat", "openai", sdktranslator.FormatOpenAI, 300, 10},
-		{"messages", "claude", sdktranslator.FormatClaude, 300, 0},
+		{"messages", "claude", sdktranslator.FormatClaude, 300, 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// A real slot that never receives a record: this exercises the
