@@ -90,6 +90,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
+		return nil, errValidate
+	}
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
@@ -170,6 +173,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize xAI keys: drop entries without base-url
 	cfg.SanitizeXAIKeys()
+
+	// Sanitize Meta keys.
+	cfg.SanitizeMetaKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
