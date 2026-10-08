@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -32,6 +33,18 @@ func newMux(cfg *config.Config) *http.ServeMux {
 	return mux
 }
 
+// authenticateGateway rejects callers before reading credentials or request bodies.
+func authenticateGateway(secret string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Tokenswim-Gateway-Secret")), []byte(secret)) != 1 {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		r.Header.Del("X-Tokenswim-Gateway-Secret")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // healthz identifies the service and its protocol version so a Tokenswim health
 // probe can tell this gateway apart from any other HTTP listener on the node.
 func healthz(w http.ResponseWriter, _ *http.Request) {
@@ -56,7 +69,12 @@ func main() {
 		cfg.ProxyURL = proxyURL
 		log.Printf("tokenswim-gateway: upstream proxy %s", proxyutil.Redact(proxyURL))
 	}
-	mux := newMux(cfg)
+	secret := os.Getenv("GATEWAY_SECRET")
+	if len(secret) < 32 {
+		log.Print("tokenswim-gateway: GATEWAY_SECRET must contain at least 32 characters")
+		os.Exit(1)
+	}
+	mux := authenticateGateway(secret, newMux(cfg))
 
 	addr := ":8787"
 	log.Printf("tokenswim-gateway listening on %s", addr)
