@@ -345,24 +345,21 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth, clientHeade
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
-// requests. When using_api is true, this matches the standard
-// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
-// when using_api is false and the resolved chat base URL is the official CLI
-// chat-proxy endpoint.
+// requests. When using_api is true, this matches applyXAIHeaders. Otherwise,
+// CLI identity follows the OAuth credential, including when base_url names a
+// relay for the CLI endpoint. Custom headers can still override the identity.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	if xaiUsingAPI(auth) {
 		applyXAIHeaders(r, auth, token, stream, sessionID, clientHeaders...)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		clientVer := xaiClientVersion()
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, clientVer)
-		r.Header.Set("User-Agent", "xai-grok-workspace/"+clientVer)
-		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
-		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
-	}
+	clientVer := xaiClientVersion()
+	r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+	r.Header.Set(xaiClientVersionHeader, clientVer)
+	r.Header.Set("User-Agent", "xai-grok-workspace/"+clientVer)
+	r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
+	r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
 	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 

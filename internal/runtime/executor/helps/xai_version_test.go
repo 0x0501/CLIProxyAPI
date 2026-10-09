@@ -186,7 +186,7 @@ func TestRefreshXAIClientVersionUsesConfiguredProxy(t *testing.T) {
 			http.Error(w, "expected absolute proxy URI", http.StatusBadRequest)
 			return
 		}
-		outbound, errReq := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
+		outbound, errReq := http.NewRequestWithContext(r.Context(), r.Method, registry.URL, nil)
 		if errReq != nil {
 			http.Error(w, errReq.Error(), http.StatusBadGateway)
 			return
@@ -211,7 +211,9 @@ func TestRefreshXAIClientVersionUsesConfiguredProxy(t *testing.T) {
 	}))
 	defer proxyServer.Close()
 
-	restoreURL := OverrideXAINPMRegistryURLForTest(registry.URL)
+	// Loopback relay destinations deliberately bypass proxies in this fork.
+	// Use an external registry address and let the test proxy reach the fixture.
+	restoreURL := OverrideXAINPMRegistryURLForTest("http://registry.example.invalid/@xai-official/grok/latest")
 	defer restoreURL()
 	restoreProxy := setXAIVersionProxyURLForTest(proxyServer.URL)
 	defer restoreProxy()

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // BuildAuth drops the envelope's credential into Metadata, and lifts base_url

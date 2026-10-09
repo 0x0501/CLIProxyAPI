@@ -4,11 +4,11 @@ import (
 	"bytes"
 
 	// Registers all codex<->openai request/response (stream+non-stream) translators.
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	"github.com/tidwall/gjson"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 // FormatProfile describes how to frame, terminate, and read usage for one

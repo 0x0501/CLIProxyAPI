@@ -4,16 +4,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/gateway"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/gateway"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 // gatewayProtocol is the version of the Tokenswim gateway wire contract this
@@ -56,6 +58,7 @@ func main() {
 		cfg.ProxyURL = proxyURL
 		log.Printf("tokenswim-gateway: upstream proxy %s", proxyutil.Redact(proxyURL))
 	}
+	executor.StartXAIVersionUpdater(context.Background(), cfg.ProxyURL)
 	mux := newMux(cfg)
 
 	addr := ":8787"
