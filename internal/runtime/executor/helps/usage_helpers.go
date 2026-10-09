@@ -14,17 +14,20 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 type UsageReporter struct {
+	requestID           string
+	traceID             string
 	provider            string
 	baseURL             string
 	executorType        string
@@ -106,7 +109,13 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 			}
 		}
 	}
+	traceID := usage.TraceIDFromContext(ctx)
+	if traceID == "" {
+		traceID = internallogging.GetRequestID(ctx)
+	}
 	reporter := &UsageReporter{
+		requestID:       uuid.NewString(),
+		traceID:         traceID,
 		provider:        provider,
 		baseURL:         baseURL,
 		model:           model,
@@ -213,12 +222,6 @@ func (r *UsageReporter) ObserveResponseModel(payload []byte) {
 	}
 }
 
-// ObserveCodexResponseModel stores the model reported by a codex upstream event and
-// ignores payloads without one; the substitution warning is emitted at publish time.
-func (r *UsageReporter) ObserveCodexResponseModel(payload []byte) {
-	r.ObserveResponseModel(payload)
-}
-
 // SetResponseModel sets the reported model directly if valid and not already marked final.
 func (r *UsageReporter) SetResponseModel(model string) {
 	if r == nil || r.responseModelFinal.Load() {
@@ -261,8 +264,8 @@ func (r *UsageReporter) IsResponseModelFinal() bool {
 	return r != nil && r.responseModelFinal.Load()
 }
 
-// warnModelSubstitution warns about a silent upstream model swap, throttled per
-// credential and model pair, and labels the credential by index only, never by account.
+// warnModelSubstitution warns about a silent upstream model swap, and labels the
+// credential by index only, never by account.
 func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
 	if r == nil {
 		return
@@ -278,29 +281,11 @@ func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
 	if r.model != "" && !IsModelSubstituted(r.model, served) {
 		return
 	}
-	// The throttle key uses the same normalized names as the substitution check, so
-	// aliases of one pair share a window instead of each warning on its own.
-	requested := normalizeModelName(expectedModel)
-	servedNormalized := normalizeModelName(served)
-	providerName := r.provider
+	providerName := strings.TrimSpace(r.provider)
 	if providerName == "" {
-		providerName = "codex"
-	}
-	if !codexModelSubstitutionWarns.allow(codexModelSubstitutionKey{
-		provider:  providerName,
-		authID:    r.authID,
-		requested: requested,
-		served:    servedNormalized,
-	}) {
-		return
+		providerName = "unknown"
 	}
 	LogWithRequestID(ctx).Warnf("%s executor: upstream served model %q for requested model %q (auth_index=%s)", providerName, served, r.model, r.authIndexForLog())
-}
-
-// warnCodexModelSubstitution warns about a silent upstream model swap, throttled per
-// credential and model pair, and labels the credential by index only, never by account.
-func (r *UsageReporter) warnCodexModelSubstitution(ctx context.Context) {
-	r.warnModelSubstitution(ctx)
 }
 
 // authIndexForLog labels the credential without exposing its file name or account.
@@ -515,7 +500,9 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
-	return r.buildRecordForModel(model, detail, false, usage.Failure{}), true
+	rec := r.buildRecordForModel(model, detail, false, usage.Failure{})
+	rec.RequestID = uuid.NewString()
+	return rec, true
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
@@ -585,6 +572,22 @@ func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) 
 	usage.PublishRecord(ctx, record)
 }
 
+// RequestID returns the execution instance request ID for this reporter.
+func (r *UsageReporter) RequestID() string {
+	if r == nil {
+		return ""
+	}
+	return r.requestID
+}
+
+// TraceID returns the parent inbound request ID for this reporter.
+func (r *UsageReporter) TraceID() string {
+	if r == nil {
+		return ""
+	}
+	return r.traceID
+}
+
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures ...usage.Failure) usage.Record {
 	var fail usage.Failure
 	if len(failures) > 0 {
@@ -607,6 +610,8 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		responseModel = r.ResponseModel()
 	}
 	return usage.Record{
+		RequestID:           r.requestID,
+		TraceID:             r.traceID,
 		Provider:            r.provider,
 		BaseURL:             r.baseURL,
 		ExecutorType:        r.executorType,

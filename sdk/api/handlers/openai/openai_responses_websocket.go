@@ -15,11 +15,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -264,21 +264,28 @@ func truncateWebsocketCloseReason(reason string, maxBytes int) string {
 
 // ResponsesWebsocket handles websocket requests for /v1/responses.
 // It accepts `response.create` and `response.append` requests and streams
-// response events back as JSON websocket text messages.
+// response events back as JSON websocket text messages. `response.interrupt`
+// is forwarded to the current Codex upstream socket without starting a new turn.
 func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	conn, err := responsesWebsocketUpgrader.Upgrade(c.Writer, c.Request, websocketUpgradeHeaders(c.Request))
 	if err != nil {
 		return
 	}
-	var duplexInput <-chan cliproxyexecutor.WebsocketInput
-	if h != nil && h.Cfg != nil && h.Cfg.CodexResponseSteering {
-		socketCtx, cancelSocket := context.WithCancel(c.Request.Context())
-		defer cancelSocket()
-		c.Request = c.Request.WithContext(socketCtx)
-		duplexInput = readResponsesWebsocketInput(socketCtx, cancelSocket, conn)
-	}
 	writer := newResponsesWebsocketWriter(conn)
 	passthroughSessionID := uuid.NewString()
+	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
+	defer cancelSocket(nil)
+	c.Request = c.Request.WithContext(socketCtx)
+	// The reader owns the client socket so an in-flight interrupt is not stuck
+	// behind the response currently being forwarded.
+	localInterrupt := newResponsesLocalInterrupt()
+	input := readResponsesWebsocketInput(socketCtx, cancelSocket, conn, func(payload []byte) error {
+		return h.forwardResponsesWebsocketInterrupt(socketCtx, passthroughSessionID, payload)
+	}, localInterrupt, writer)
+	var duplexInput <-chan cliproxyexecutor.WebsocketInput
+	if h != nil && h.Cfg != nil && h.Cfg.CodexResponseSteering {
+		duplexInput = input
+	}
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
@@ -289,18 +296,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	wsDone := make(chan struct{})
 	defer close(wsDone)
+	var codexDuplexStream atomic.Bool
 
 	if h != nil && h.AuthManager != nil {
 		type upstreamDisconnectSubscriber interface {
 			UpstreamDisconnectChan(sessionID string) <-chan error
 		}
 		for _, provider := range []string{"codex", "xai"} {
-			if provider == "codex" && duplexInput != nil {
-				// Duplex owns the socket until its ordered event stream ends.
-				// An out-of-band close could discard an already received steering
-				// acknowledgement or pending event before it reaches the client.
-				continue
-			}
 			exec, ok := h.AuthManager.Executor(provider)
 			if !ok || exec == nil {
 				continue
@@ -313,6 +315,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 						case <-wsDone:
 							return
 						case disconnectErr := <-disconnectCh:
+							if provider == "codex" && codexDuplexStream.Load() {
+								// Only the selected credential's duplex stream owns closure:
+								// drain its acknowledgements and pending events in order.
+								// OAuth-only steering still leaves API keys in normal mode.
+								return
+							}
 							writer.closeForUpstreamDisconnect(disconnectErr)
 						}
 					}()
@@ -406,18 +414,18 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var msgType int
 		var payload []byte
 		var errReadMessage error
-		if duplexInput == nil {
-			msgType, payload, errReadMessage = conn.ReadMessage()
-		} else {
-			select {
-			case message, ok := <-duplexInput:
-				if !ok {
-					return
-				}
+		select {
+		case message, ok := <-input:
+			if !ok {
+				errReadMessage = context.Cause(socketCtx)
+			} else {
 				msgType, payload, errReadMessage = websocket.TextMessage, message.Payload, message.Err
-			case <-c.Request.Context().Done():
-				return
 			}
+		case <-socketCtx.Done():
+			errReadMessage = context.Cause(socketCtx)
+		}
+		if errReadMessage != nil && errors.Is(errReadMessage, context.Canceled) {
+			return
 		}
 		if errReadMessage != nil {
 			wsTerminateErr = errReadMessage
@@ -685,7 +693,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		selectedAuthObserved := false
 		nativeRequest := util.IsCodexResponsesLiteRequest(payload, c.Request.Header)
 		var preserveNativeOutput atomic.Bool
-		var codexDuplexStream atomic.Bool
+		codexDuplexStream.Store(false)
 		pinnedAuthAttempted := false
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
@@ -754,6 +762,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				duplexStream:             codexDuplexStream.Load,
 				toolCacheTurn:            toolCacheTurn,
 				suppressError:            replayPinnedAuthFailure,
+				localInterrupt:           localInterrupt,
 			},
 		)
 		if errForward != nil {

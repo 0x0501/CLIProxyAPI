@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
@@ -711,4 +711,72 @@ func TestUsageQueuePluginPayloadSameOriginFallback(t *testing.T) {
 			t.Fatalf("expected parent_session_id to be omitted when record is independent root, got %s", payload["parent_session_id"])
 		}
 	})
+}
+
+func TestUsageQueuePlugin_SchemeB_ExecutionIDAndTraceID(t *testing.T) {
+	prevEnabled := Enabled()
+	prevUsageEnabled := UsageStatisticsEnabled()
+	SetEnabled(true)
+	SetUsageStatisticsEnabled(true)
+	t.Cleanup(func() {
+		SetEnabled(prevEnabled)
+		SetUsageStatisticsEnabled(prevUsageEnabled)
+	})
+
+	plugin := &usageQueuePlugin{}
+	ctx := internallogging.WithRequestID(context.Background(), "000000ab")
+	execUUID := "12345678-1234-4234-8234-123456789abc"
+
+	plugin.HandleUsage(ctx, coreusage.Record{
+		RequestID: execUUID,
+		TraceID:   "000000ab",
+		Provider:  "openai",
+		Model:     "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 5,
+			TotalTokens:  15,
+		},
+	})
+
+	payload := popSinglePayload(t)
+	// Scheme B: request_id preserves the 8-character hex trace ID
+	requireStringField(t, payload, "request_id", "000000ab")
+	// Scheme B: execution_id carries the UUID v4 execution instance ID
+	requireStringField(t, payload, "execution_id", execUUID)
+	// Scheme B: trace_id explicitly carries the 8-character hex trace ID
+	requireStringField(t, payload, "trace_id", "000000ab")
+}
+
+func TestUsageQueuePlugin_SchemeB_StrictLegacyRequestIDPreservation(t *testing.T) {
+	prevEnabled := Enabled()
+	prevUsageEnabled := UsageStatisticsEnabled()
+	SetEnabled(true)
+	SetUsageStatisticsEnabled(true)
+	t.Cleanup(func() {
+		SetEnabled(prevEnabled)
+		SetUsageStatisticsEnabled(prevUsageEnabled)
+	})
+
+	plugin := &usageQueuePlugin{}
+	ctx := internallogging.WithRequestID(context.Background(), "legacy-log-id")
+	execUUID := "12345678-1234-4234-8234-123456789abc"
+
+	plugin.HandleUsage(ctx, coreusage.Record{
+		RequestID: execUUID,
+		TraceID:   "custom-trace-id",
+		Provider:  "openai",
+		Model:     "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens: 5,
+		},
+	})
+
+	payload := popSinglePayload(t)
+	// request_id strictly preserves legacy GetRequestID(ctx)
+	requireStringField(t, payload, "request_id", "legacy-log-id")
+	// execution_id carries the UUID v4
+	requireStringField(t, payload, "execution_id", execUUID)
+	// trace_id reflects the record.TraceID
+	requireStringField(t, payload, "trace_id", "custom-trace-id")
 }

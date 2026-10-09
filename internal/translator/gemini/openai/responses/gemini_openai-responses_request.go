@@ -7,19 +7,24 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
 
-func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
+	return convertOpenAIResponsesRequestToGemini(modelName, inputRawJSON, stream)
+}
+
+func convertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	rawJSON := inputRawJSON
+	var drops translatorcommon.UserTurnDrops
 
 	// Note: stream parameter is part of the fixed method signature
 	useGeminiNativeReasoningLayout := sigcompat.SignatureProviderFromModelName(modelName) == sigcompat.SignatureProviderGemini
@@ -230,6 +235,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				if len(partsToProcess) > 0 {
 					currentRole := ""
 					currentParts := make([][]byte, 0)
+					// Counts the user parts this item really sends; an empty text part does not.
+					userSendable := 0
 
 					flush := func() {
 						if currentRole == "" || len(currentParts) == 0 {
@@ -271,24 +278,35 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						}
 
 						var partJSON []byte
+						sendsContent := false
 						switch contentType {
 						case "input_text", "output_text", "text":
 							if text := contentItem.Get("text"); text.Exists() {
 								partJSON = []byte(`{"text":""}`)
 								partJSON, _ = sjson.SetBytes(partJSON, "text", text.String())
+								sendsContent = text.String() != ""
 							}
 						default:
 							if part, ok := openAIResponsesPartFromBlock(contentItem); ok {
 								partJSON = part
+								sendsContent = true
+							} else if effRole == "user" && isResponsesAttachmentPartType(contentType) {
+								// Gemini has no field for a bare file id and no way to fetch
+								// the bytes, so the attachment cannot be sent.
+								drops.Drop(contentType)
 							}
 						}
 
 						if len(partJSON) > 0 {
 							currentParts = append(currentParts, partJSON)
 						}
+						if sendsContent && effRole == "user" {
+							userSendable++
+						}
 					}
 
 					flush()
+					drops.EndTurn(userSendable)
 				} else if contentArray.Type == gjson.String {
 					effRole := "user"
 					if itemRole != "" {
@@ -309,7 +327,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				hasEncounteredConversation = true
 				signature := geminiResponsesThoughtSignature
 				if rawSignature := strings.TrimSpace(item.Get("_cpa_reasoning_signature").String()); rawSignature != "" {
-					signature = openAIResponsesGeminiThoughtSignature(rawSignature)
+					signature = sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiFunctionCall)
 				}
 				if thoughtText := item.Get("_cpa_reasoning_summary").String(); thoughtText != "" {
 					contentItems = append(contentItems, buildOpenAIResponsesReasoningFunctionCallModelContent(thoughtText, item, signature, forwardMap))
@@ -406,7 +424,10 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						i++
 					}
 				}
-				signature := openAIResponsesGeminiThoughtSignature(rawSignature)
+				signature := ""
+				if strings.TrimSpace(rawSignature) != "" {
+					signature = openAIResponsesGeminiThoughtSignature(rawSignature)
+				}
 
 				visibleText := ""
 				if useGeminiNativeReasoningLayout && i+1 < len(normalized) {
@@ -416,8 +437,12 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					if visible, ok := openAIResponsesAssistantVisibleText(next); ok && canBindText {
 						visibleText = visible
 						i++
-					} else if (next.Get("type").String() == "function_call" || next.Get("type").String() == "custom_tool_call") && canBindFunction && strings.TrimSpace(next.Get("_cpa_reasoning_signature").String()) == "" && signature != geminiResponsesThoughtSignature {
-						contentItems = append(contentItems, buildOpenAIResponsesReasoningFunctionCallModelContent(thoughtText, next, signature, forwardMap))
+					} else if (next.Get("type").String() == "function_call" || next.Get("type").String() == "custom_tool_call") && canBindFunction && strings.TrimSpace(next.Get("_cpa_reasoning_signature").String()) == "" {
+						funcSig := signature
+						if funcSig == "" {
+							funcSig = geminiResponsesThoughtSignature
+						}
+						contentItems = append(contentItems, buildOpenAIResponsesReasoningFunctionCallModelContent(thoughtText, next, funcSig, forwardMap))
 						if callID := extractOpenAIResponsesCallID(next); callID != "" {
 							pendingFunctionCallIDs = append(pendingFunctionCallIDs, callID)
 						}
@@ -497,7 +522,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	if useGeminiNativeReasoningLayout {
 		result = sigcompat.SanitizeGeminiRequestThoughtSignatures(result, "contents")
 	}
-	return stripTrailingOpenAIResponsesModelPrefill(result)
+	return stripTrailingOpenAIResponsesModelPrefill(result), drops.Err()
 }
 
 func geminiContent(role string, parts [][]byte) []byte {
@@ -943,6 +968,20 @@ func isResponsesContentPartType(itemType string) bool {
 	switch strings.ToLower(strings.TrimSpace(itemType)) {
 	case "input_text", "output_text", "text",
 		"input_image", "image_url", "image",
+		"input_audio", "audio",
+		"input_video", "video_url", "video",
+		"input_file", "file":
+		return true
+	default:
+		return false
+	}
+}
+
+// isResponsesAttachmentPartType reports the content part types that carry a
+// file, image, audio or video rather than text.
+func isResponsesAttachmentPartType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "input_image", "image_url", "image",
 		"input_audio", "audio",
 		"input_video", "video_url", "video",
 		"input_file", "file":
@@ -1701,7 +1740,7 @@ func buildOpenAIResponsesFunctionResponseParts(item gjson.Result, functionNamesB
 		result, isRaw, images := parseOpenAIResponsesArrayOutput(outputResult)
 		imageParts = images
 		if isRaw {
-			functionResponse, _ = sjson.SetRawBytes(functionResponse, "functionResponse.response.result", []byte(result))
+			functionResponse = translatorcommon.SetGeminiFunctionResponseRaw(functionResponse, "functionResponse.response.result", result)
 		} else {
 			functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.response.result", result)
 		}
@@ -1710,7 +1749,7 @@ func buildOpenAIResponsesFunctionResponseParts(item gjson.Result, functionNamesB
 			imageParts = append(imageParts, geminiResponsesInlineDataPart(mimeType, data))
 			functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.response.result", "")
 		} else {
-			functionResponse, _ = sjson.SetRawBytes(functionResponse, "functionResponse.response.result", []byte(outputResult.Raw))
+			functionResponse = translatorcommon.SetGeminiFunctionResponseResult(functionResponse, "functionResponse.response.result", outputResult)
 		}
 	case outputResult.Raw != "" && outputResult.Raw != "null":
 		functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.response.result", outputResult.String())
@@ -1803,8 +1842,12 @@ func buildOpenAIResponsesReasoningFunctionCallModelContent(thoughtText string, i
 
 func buildOpenAIResponsesReasoningModelContent(thoughtText, visibleText, signature string, useGeminiNativeReasoningLayout bool) []byte {
 	modelContent := []byte(`{"role":"model","parts":[]}`)
+	hasRealSignature := signature != "" && signature != geminiResponsesThoughtSignature
 	if useGeminiNativeReasoningLayout {
 		if thoughtText == "" && visibleText == "" {
+			if !hasRealSignature {
+				return nil
+			}
 			carrier := []byte(`{"text":"","thoughtSignature":""}`)
 			carrier, _ = sjson.SetBytes(carrier, "thoughtSignature", signature)
 			return translatorcommon.SetRawArrayItems(modelContent, "parts", [][]byte{carrier})
@@ -1813,28 +1856,35 @@ func buildOpenAIResponsesReasoningModelContent(thoughtText, visibleText, signatu
 		if thoughtText != "" {
 			thought := []byte(`{"text":"","thought":true}`)
 			thought, _ = sjson.SetBytes(thought, "text", thoughtText)
-			if visibleText == "" {
+			if visibleText == "" && hasRealSignature {
 				thought, _ = sjson.SetBytes(thought, "thoughtSignature", signature)
 			}
 			parts = append(parts, thought)
 		}
 		if visibleText != "" {
-			visible := []byte(`{"text":"","thoughtSignature":""}`)
+			visible := []byte(`{"text":""}`)
 			visible, _ = sjson.SetBytes(visible, "text", visibleText)
-			visible, _ = sjson.SetBytes(visible, "thoughtSignature", signature)
+			if hasRealSignature {
+				visible, _ = sjson.SetBytes(visible, "thoughtSignature", signature)
+			}
 			parts = append(parts, visible)
 		}
 		return translatorcommon.SetRawArrayItems(modelContent, "parts", parts)
 	}
 
-	thought := []byte(`{"text":"","thoughtSignature":"","thought":true}`)
+	thought := []byte(`{"text":"","thought":true}`)
 	thought, _ = sjson.SetBytes(thought, "text", thoughtText)
-	thought, _ = sjson.SetBytes(thought, "thoughtSignature", signature)
+	if hasRealSignature {
+		thought, _ = sjson.SetBytes(thought, "thoughtSignature", signature)
+	}
 	return translatorcommon.SetRawArrayItems(modelContent, "parts", [][]byte{thought})
 }
 
 func openAIResponsesGeminiThoughtSignature(rawSignature string) string {
-	return sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+	if sig, ok := sigcompat.CompatibleSignatureForProviderBlock(sigcompat.SignatureProviderGemini, rawSignature, sigcompat.SignatureBlockKindGeminiModelPart); ok {
+		return sig
+	}
+	return ""
 }
 
 func applyOpenAIResponsesTextFormatToGemini(out []byte, root gjson.Result) []byte {
