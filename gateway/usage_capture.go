@@ -30,7 +30,7 @@ type UsageCapture struct {
 	model string
 
 	mu     sync.Mutex
-	detail usage.Detail
+	record usage.Record
 	have   bool
 
 	once  sync.Once
@@ -75,7 +75,7 @@ func (c *UsageCapture) offer(record usage.Record) {
 		c.mu.Unlock()
 		return
 	}
-	c.detail, c.have = record.Detail, true
+	c.record, c.have = record, true
 	c.mu.Unlock()
 	c.once.Do(func() { close(c.ready) })
 }
@@ -83,9 +83,9 @@ func (c *UsageCapture) offer(record usage.Record) {
 // Wait blocks up to usageCaptureWait for the raw upstream detail. ok=false means
 // no record arrived in time; the caller must then fall back to re-parsing the
 // translated stream.
-func (c *UsageCapture) Wait() (usage.Detail, bool) {
+func (c *UsageCapture) Wait() (usage.Record, bool) {
 	if c == nil {
-		return usage.Detail{}, false
+		return usage.Record{}, false
 	}
 	timer := time.NewTimer(usageCaptureWait)
 	defer timer.Stop()
@@ -95,7 +95,7 @@ func (c *UsageCapture) Wait() (usage.Detail, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.detail, c.have
+	return c.record, c.have
 }
 
 // ResolveUsage picks the detail the tokenswim.usage frame (and the non-stream
@@ -103,15 +103,41 @@ func (c *UsageCapture) Wait() (usage.Detail, bool) {
 // otherwise the re-parse of the translated client stream. A raw record with no
 // tokens is treated as no record — failure publications carry an empty detail
 // and must never zero a request the translated stream can still account for.
-func ResolveUsage(capture *UsageCapture, reparsed usage.Detail, haveReparsed bool, model string) (usage.Detail, bool) {
-	raw, ok := capture.Wait()
-	if !ok || !usageHasTokens(raw) {
-		return reparsed, haveReparsed
+func ResolveUsage(capture *UsageCapture, reparsed usage.Detail, haveReparsed bool, model string) (UsagePayload, bool) {
+	record, haveRecord := capture.Wait()
+	detail, have := reparsed, haveReparsed
+	if haveRecord && usageHasTokens(record.Detail) {
+		if haveReparsed {
+			logUsageDivergence(model, record.Detail, reparsed)
+		}
+		detail, have = record.Detail, true
 	}
-	if haveReparsed {
-		logUsageDivergence(model, raw, reparsed)
+	payload := UsageFromDetail(detail, model)
+	if haveRecord && record.Latency > 0 {
+		ms := float64(record.Latency) / float64(time.Millisecond)
+		payload.LatencyMs = &ms
+		payload.TTFTMs = tokenTiming(record)
 	}
-	return raw, true
+	payload.TimingOnly = !have
+	return payload, have || payload.TTFTMs != nil
+}
+
+// Token timing does not depend on a final usage count: an interrupted request
+// can have a reliable first-token measurement while its TPS remains unknown.
+func tokenTiming(record usage.Record) *float64 {
+	if !record.TTFTIsToken || record.TTFT <= 0 || record.TTFT > record.Latency {
+		return nil
+	}
+	ms := float64(record.TTFT) / float64(time.Millisecond)
+	return &ms
+}
+
+func errorWithTiming(payload ErrorPayload, capture *UsageCapture) ErrorPayload {
+	record, ok := capture.Wait()
+	if ok {
+		payload.TTFTMs = tokenTiming(record)
+	}
+	return payload
 }
 
 // logUsageDivergence is the translator-fidelity sentinel that replaces ADR

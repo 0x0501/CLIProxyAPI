@@ -19,6 +19,11 @@ type UsagePayload struct {
 	TotalTokens         int64                `json:"total_tokens"`
 	TokenBreakdown      usage.TokenBreakdown `json:"token_breakdown"`
 	ResponseServiceTier string               `json:"response_service_tier,omitempty"`
+	// Executor timings, absent when no raw usage record was captured.
+	LatencyMs *float64 `json:"latency_ms,omitempty"`
+	TTFTMs    *float64 `json:"ttft_ms,omitempty"`
+	// A measured first token is available, but final usage is absent.
+	TimingOnly bool `json:"timing_only,omitempty"`
 	// Structural completeness: Valid() && Quality == complete.
 	BreakdownComplete bool   `json:"breakdown_complete"`
 	Model             string `json:"model"`

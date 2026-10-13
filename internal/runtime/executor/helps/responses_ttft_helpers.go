@@ -90,15 +90,8 @@ func IsResponsesTokenEvent(payload []byte) bool {
 		}
 		return false
 
-	// Terminal events fallback to guarantee TTFT is never missed on truncated, failed, or fast turns
-	case "response.completed",
-		"response.done",
-		"response.incomplete",
-		"response.failed",
-		"error":
-		return true
-
-	// All other container lifecycles (added, created, in_progress, search state machines, metadata)
+	// Terminal status/usage, lifecycle metadata and errors do not prove that
+	// an output token was observed. Keep only the first-packet fallback there.
 	default:
 		return false
 	}

@@ -198,29 +198,29 @@ func TestIsResponsesTokenEvent_Classification(t *testing.T) {
 			want:    true,
 		},
 		{
-			name:    "response completed fallback",
+			name:    "response completed without output",
 			payload: `{"type":"response.completed","response":{"id":"resp_123","status":"completed"}}`,
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "response done fallback",
+			name:    "response done without output",
 			payload: `{"type":"response.done","response":{"id":"resp_123"}}`,
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "response incomplete fallback",
+			name:    "response incomplete without output",
 			payload: `{"type":"response.incomplete","response":{"id":"resp_123","status":"incomplete"}}`,
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "response failed fallback",
+			name:    "response failed without output",
 			payload: `{"type":"response.failed","response":{"id":"resp_123","status":"failed"}}`,
-			want:    true,
+			want:    false,
 		},
 		{
-			name:    "generic error fallback",
+			name:    "generic error without output",
 			payload: `{"type":"error","error":{"message":"overloaded","code":"rate_limit_exceeded"}}`,
-			want:    true,
+			want:    false,
 		},
 		// SSE line format verification
 		{

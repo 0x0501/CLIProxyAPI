@@ -140,7 +140,8 @@ func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.Stream
 			// Flush a pending data-bearing event; drop a bare event: so the error
 			// frame is never preceded by empty-data JSON for the client to parse.
 			asm.flush(w)
-			_, _ = w.Write(FormatErrorEvent(ClassifyExecError(chunk.Err)))
+			flush()
+			_, _ = w.Write(FormatErrorEvent(errorWithTiming(ClassifyExecError(chunk.Err), capture)))
 			flush()
 			return
 		}
@@ -177,8 +178,8 @@ func PipeStream(w io.Writer, flush func(), chunks <-chan cliproxyexecutor.Stream
 	asm.flush(w)
 	// The bounded wait for raw upstream detail sits here, after the last
 	// translated chunk, so it can never delay a client-visible token.
-	if d, ok := ResolveUsage(capture, reparsed, haveReparsed, model); ok {
-		_, _ = w.Write(FormatUsageEvent(UsageFromDetail(d, model)))
+	if u, ok := ResolveUsage(capture, reparsed, haveReparsed, model); ok {
+		_, _ = w.Write(FormatUsageEvent(u))
 		flush()
 	}
 }

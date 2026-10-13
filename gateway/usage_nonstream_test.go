@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -28,13 +29,15 @@ type fakeExecutor struct {
 	payload []byte
 	model   string
 	publish *usage.Detail
+	latency time.Duration
+	ttft    time.Duration
 }
 
 func (f *fakeExecutor) Identifier() string { return "fake" }
 
 func (f *fakeExecutor) Execute(ctx context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if f.publish != nil {
-		usage.PublishRecord(ctx, usage.Record{Model: f.model, Detail: *f.publish})
+		usage.PublishRecord(ctx, usage.Record{Model: f.model, Detail: *f.publish, Latency: f.latency, TTFT: f.ttft, TTFTIsToken: true})
 	}
 	return cliproxyexecutor.Response{Payload: f.payload}, nil
 }
@@ -81,6 +84,17 @@ func nonStreamUsageHeader(t *testing.T, exec *fakeExecutor) (UsagePayload, bool)
 		t.Fatalf("X-Tokenswim-Usage is not valid JSON (%v): %s", err, raw)
 	}
 	return u, true
+}
+
+func TestNonStreamUsageForwardsExecutorTiming(t *testing.T) {
+	detail := rawFixtureDetail(t)
+	u, ok := nonStreamUsageHeader(t, &fakeExecutor{
+		payload: []byte(claudeNonStreamBody), model: fixtureModel, publish: &detail,
+		latency: 2500 * time.Millisecond, ttft: 500 * time.Millisecond,
+	})
+	if !ok || u.LatencyMs == nil || *u.LatencyMs != 2500 || u.TTFTMs == nil || *u.TTFTMs != 500 {
+		t.Fatalf("non-stream timing was lost: %+v", u)
+	}
 }
 
 // The non-stream usage header must follow raw upstream too — same rule as the

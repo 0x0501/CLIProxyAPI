@@ -73,12 +73,12 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 		if !opts.Stream {
 			resp, xerr := exec.Execute(ctx, auth, execReq, opts)
 			if xerr != nil {
-				writePreStreamError(w, ClassifyExecError(xerr))
+				writePreStreamError(w, errorWithTiming(ClassifyExecError(xerr), capture))
 				return
 			}
 			reparsed, haveReparsed := profile.ParseUsage(resp.Payload)
-			if d, ok := ResolveUsage(capture, reparsed, haveReparsed, modelHint.Model); ok {
-				if b, err := json.Marshal(UsageFromDetail(d, modelHint.Model)); err == nil {
+			if u, ok := ResolveUsage(capture, reparsed, haveReparsed, modelHint.Model); ok {
+				if b, err := json.Marshal(u); err == nil {
 					w.Header().Set("X-Tokenswim-Usage", string(b))
 				}
 			}
@@ -90,7 +90,7 @@ func Handler(cfg *config.Config) http.HandlerFunc {
 
 		result, xerr := exec.ExecuteStream(ctx, auth, execReq, opts)
 		if xerr != nil {
-			writePreStreamError(w, ClassifyExecError(xerr))
+			writePreStreamError(w, errorWithTiming(ClassifyExecError(xerr), capture))
 			return
 		}
 

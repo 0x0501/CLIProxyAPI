@@ -53,6 +53,7 @@ type UsageReporter struct {
 	firstPacketSet      bool
 	ttftStart           time.Time
 	ttftSet             bool
+	ttftIsToken         bool
 	once                sync.Once
 
 	responseModelMu sync.RWMutex
@@ -464,8 +465,11 @@ func (r *UsageReporter) ObserveTokenEvent(isToken bool) {
 		r.firstPacketSet = true
 	}
 	if isToken {
-		r.ttft = time.Since(start)
+		// Token TTFT and Latency must share the executor start so subtraction
+		// measures generation time, without request preparation in the interval.
+		r.ttft = time.Since(r.requestedAt)
 		r.ttftSet = true
+		r.ttftIsToken = true
 		r.ttftStart = time.Time{}
 	}
 }
@@ -634,6 +638,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		RequestedAt:         r.requestedAt,
 		Latency:             r.latency(),
 		TTFT:                r.ttftDuration(),
+		TTFTIsToken:         r.hasTokenTTFT(),
 		Failed:              failed,
 		Fail:                fail,
 		Detail:              detail,
@@ -705,6 +710,15 @@ func (r *UsageReporter) ttftDuration() time.Duration {
 		return r.firstPacketDuration
 	}
 	return 0
+}
+
+func (r *UsageReporter) hasTokenTTFT() bool {
+	if r == nil {
+		return false
+	}
+	r.ttftMu.RLock()
+	defer r.ttftMu.RUnlock()
+	return r.ttftIsToken
 }
 
 type usageTTFTRoundTripper struct {

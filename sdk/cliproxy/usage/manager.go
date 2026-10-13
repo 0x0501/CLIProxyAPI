@@ -62,6 +62,8 @@ type Record struct {
 	RequestedAt time.Time
 	Latency     time.Duration
 	TTFT        time.Duration
+	// TTFTIsToken distinguishes substantive output from first-packet fallback.
+	TTFTIsToken bool
 	Failed      bool
 	Fail        Failure
 	Detail      Detail

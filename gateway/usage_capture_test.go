@@ -4,12 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -117,14 +123,78 @@ func TestPipeStreamUsageFrameFollowsRawUpstreamOnEveryClientFormat(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, capture := NewUsageCapture(context.Background(), fixtureModel)
-			usage.PublishRecord(ctx, usage.Record{Model: fixtureModel, Detail: raw})
+			usage.PublishRecord(ctx, usage.Record{Model: fixtureModel, Detail: raw,
+				Latency: 3 * time.Second, TTFT: 500 * time.Millisecond, TTFTIsToken: true})
 
 			var buf bytes.Buffer
 			PipeStream(&buf, func() {}, feed(translatedChunks(t, tc.to)...),
 				LookupFormat(tc.profile), fixtureModel, capture)
 
 			assertFixtureBuckets(t, usageFrame(t, buf.Bytes()))
+			u := usageFrame(t, buf.Bytes())
+			if u.LatencyMs == nil || *u.LatencyMs != 3000 || u.TTFTMs == nil || *u.TTFTMs != 500 {
+				t.Fatalf("stream timing was lost: %+v", u)
+			}
 		})
+	}
+}
+
+func TestUsageCaptureRejectsFirstPacketFallbackAsTTFT(t *testing.T) {
+	_, capture := NewUsageCapture(context.Background(), fixtureModel)
+	capture.offer(usage.Record{Model: fixtureModel, Detail: rawFixtureDetail(t),
+		Latency: 3 * time.Second, TTFT: time.Millisecond})
+	u, ok := ResolveUsage(capture, usage.Detail{}, false, fixtureModel)
+	if !ok || u.LatencyMs == nil || u.TTFTMs != nil {
+		t.Fatalf("first-packet fallback must not be called TTFT: %+v", u)
+	}
+}
+
+func TestPipeStreamCarriesObservedTTFTAfterUpstreamReset(t *testing.T) {
+	ctx, capture := NewUsageCapture(context.Background(), fixtureModel)
+	reporter := helps.NewUsageReporter(ctx, "codex", fixtureModel, nil)
+	reporter.StartResponseTTFT()
+	helps.ObserveResponsesTokenEvent(reporter, []byte(`{"type":"response.output_text.delta","delta":"many tokens in one event"}`))
+	reporter.PublishFailure(ctx, io.ErrUnexpectedEOF)
+	var out bytes.Buffer
+	PipeStream(&out, func() {}, feed(
+		cliproxyexecutor.StreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"many tokens in one event"}}]}`)},
+		cliproxyexecutor.StreamChunk{Err: io.ErrUnexpectedEOF},
+	), LookupFormat("openai"), fixtureModel, capture)
+	const head = "event: tokenswim.error\ndata: "
+	i := strings.Index(out.String(), head)
+	if i < 0 || !strings.Contains(out.String(), "many tokens") {
+		t.Fatalf("content or error frame was lost: %s", out.String())
+	}
+	var payload ErrorPayload
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()[i+len(head):]), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.TTFTMs == nil || *payload.TTFTMs <= 0 {
+		t.Fatal("upstream reset dropped reliable first-token timing")
+	}
+	if strings.Contains(out.String(), "tokenswim.usage") {
+		t.Fatal("a failed stream must not invent complete token usage")
+	}
+}
+
+func TestPipeStreamKeepsTimingWithoutFinalUsage(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		ctx, capture := NewUsageCapture(context.Background(), fixtureModel)
+		reporter := helps.NewUsageReporter(ctx, "codex", fixtureModel, nil)
+		reporter.StartResponseTTFT()
+		const delta = `{"type":"response.output_text.delta","delta":"hello"}`
+		helps.ObserveResponsesTokenEvent(reporter, []byte(delta))
+		reporter.EnsurePublished(ctx)
+		chunks := []cliproxyexecutor.StreamChunk{{Payload: []byte("data: " + delta)}}
+		if terminal {
+			chunks = append(chunks, cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.completed","response":{"status":"completed"}}`)})
+		}
+		var out bytes.Buffer
+		PipeStream(&out, func() {}, feed(chunks...), LookupFormat("openai-response"), fixtureModel, capture)
+		payload := usageFrame(t, out.Bytes())
+		if !payload.TimingOnly || payload.TTFTMs == nil || *payload.TTFTMs <= 0 || payload.BreakdownComplete || payload.OutputTokens != 0 {
+			t.Fatalf("terminal=%v lost timing or invented usage: %+v", terminal, payload)
+		}
 	}
 }
 
@@ -274,5 +344,48 @@ func TestPipeStreamFallsBackToTranslatedReparseWithoutRawRecord(t *testing.T) {
 				t.Fatalf("input breakdown = %+v, want cache write %d", u.TokenBreakdown.Input, tc.wantCacheWrite)
 			}
 		})
+	}
+}
+
+func TestXAIStreamCleanEOFKeepsTimingWithoutFinalUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"output_index\":0,\"content_index\":0}\n\n"))
+	}))
+	defer server.Close()
+
+	const model = "grok-4.3"
+	ctx, capture := NewUsageCapture(context.Background(), model)
+	exec := executor.NewXAIExecutor(&config.Config{})
+	result, err := exec.ExecuteStream(ctx, &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	PipeStream(&output, func() {}, result.Chunks, LookupFormat("openai-response"), model, capture)
+	if !bytes.Contains(output.Bytes(), []byte("hello")) {
+		t.Fatalf("output delta was lost: %s", output.String())
+	}
+	record, have := capture.Wait()
+	if !have || !record.TTFTIsToken || record.TTFT <= 0 {
+		t.Fatalf("real executor did not publish first-token timing: %+v", record)
+	}
+	u := usageFrame(t, output.Bytes())
+	if !u.TimingOnly || u.TTFTMs == nil || *u.TTFTMs <= 0 {
+		t.Fatalf("first-token timing was lost in relay: %+v", u)
+	}
+	if u.BreakdownComplete || u.OutputTokens != 0 {
+		t.Fatalf("missing final usage must not invent token counts: %+v", u)
 	}
 }

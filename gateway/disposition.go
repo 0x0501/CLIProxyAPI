@@ -26,6 +26,7 @@ type ErrorPayload struct {
 	UpstreamStatus int         `json:"upstream_status"`
 	Code           string      `json:"code"`
 	Message        string      `json:"message"`
+	TTFTMs         *float64    `json:"ttft_ms,omitempty"`
 }
 
 // Classify maps an upstream HTTP status to a disposition. Credential-fatal
