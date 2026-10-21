@@ -28,6 +28,9 @@ var corsExposedResponseHeaders = []string{
 	"X-SERVER-BUILD-DATE",
 	"Location",
 	"Retry-After",
+	// Cross-origin management clients must read the config version token to
+	// send it back as If-Match on writes.
+	"ETag",
 	"X-Request-Id",
 	"OpenAI-Request-Id",
 }
@@ -73,7 +76,8 @@ func (s *Server) maxRequestBodyBytesMiddleware() gin.HandlerFunc {
 
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if s == nil || s.cfg == nil || !s.cfg.Home.Enabled {
+		cfg := s.getConfig()
+		if s == nil || cfg == nil || !cfg.Home.Enabled {
 			c.Next()
 			return
 		}
@@ -127,7 +131,7 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) serveExampleAPIKeyWarningPage(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.getConfig()
 	var keys []string
 	if cfg != nil {
 		keys = safemode.ExampleAPIKeys(cfg.APIKeys)

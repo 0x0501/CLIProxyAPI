@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"io"
@@ -53,10 +52,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	originalPayload := originalPayloadSource
 	isCompat := e.resolveCodexModelIsCompat(auth, req, baseModel)
-	originalTranslated, body, updatesChanged, err := translateCodexRequestPairWithUpdateIntent(from, to, baseModel, originalPayload, req.Payload, true, isCompat)
+	targetModel := resolveResponsesSignatureTargetModel(baseModel, req, opts)
+	originalTranslated, body, updatesChanged, err := translateCodexRequestPairWithUpdateIntent(from, to, targetModel, originalPayload, req.Payload, true, isCompat)
 	if err != nil {
 		return nil, err
 	}
+	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
+	body = helps.SetStringIfDifferent(body, "model", baseModel)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged)
 	if err != nil {
@@ -76,15 +78,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	useSIWC := codexUseSIWC(auth)
 	hasExplicitInstructions := gjson.GetBytes(req.Payload, "instructions").Exists() && strings.TrimSpace(gjson.GetBytes(req.Payload, "instructions").String()) != ""
+	body = ensureWebSearchToolForHistory(body, opts.Headers)
 	if !useSIWC {
 		body = normalizeCodexInstructions(body, preserveNativeOutput)
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 			body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 		}
 	} else {
-		body = applyCodexSIWCRequestBodyRules(body, hasExplicitInstructions)
+		body = applyCodexSIWCRequestBodyRules(body, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompat(ctx, "codex executor", body, isCompat)
 	body = normalizeCodexParallelToolCalls(body, opts.Headers)
 	body = helps.NormalizeCodexToolSchemas(body)
 	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, isCompat)
@@ -92,6 +94,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
+	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(ctx, "codex executor", body, isCompat, targetModel, baseURL)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, upstreamBody, err := e.cacheHelper(ctx, from, url, req, body, opts.Headers)
@@ -154,27 +157,42 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		bootstrapStart = nowCodexBootstrap()
 	}
 
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800) // 50MB
+	bufferedFrames := 0
+	bufferedBytes := 0
+	budgetExhausted := false
+	exhaustedReason := ""
+
+	scanner := helps.NewCodexSSEScanner(ctx, httpResp.Body, 52_428_800) // 50MB
+	scanner.SetOnLine(func(rawLine []byte) {
+		helps.AppendAPIResponseChunk(ctx, e.cfg, rawLine)
+	})
+	if buffering {
+		scanner.SetBudgetChecker(func(line []byte, heldLines, heldBytes int) bool {
+			timeSinceStart := nowCodexBootstrap().Sub(bootstrapStart)
+			if bootstrapTimeout > 0 && timeSinceStart >= bootstrapTimeout {
+				budgetExhausted = true
+				exhaustedReason = "time budget"
+				return true
+			}
+			if bufferedFrames+heldLines >= codexBootstrapMaxBufferedFrames {
+				budgetExhausted = true
+				exhaustedReason = "frame budget"
+				return true
+			}
+			if bufferedBytes+heldBytes >= codexBootstrapMaxBufferedBytes {
+				budgetExhausted = true
+				exhaustedReason = "byte budget"
+				return true
+			}
+			return false
+		})
+	}
 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 
 	var bufferedChunks [][]byte
-	// bufferedFrames counts the scanned lines this loop holds and bufferedBytes sums each line
-	// together with the chunks it translates into. Every iteration either holds the line or leaves
-	// the loop, so this is one unit per line read. Counting only the chunks would bound nothing for
-	// a downstream format that renders a frame as zero chunks, and counting only some line kinds
-	// would let the upstream's choice of framing decide whether the bound advances at all. The cost
-	// is that a verbose framing spends the budget faster: the three-line event:/data:/blank shape
-	// protects roughly a third as many events as a stream of bare ": keepalive" comments does.
-	//
-	// In addition to the frame and byte budgets, bootstrapTimeout bounds how long trickled
-	// frames may hold the downstream headers. A peer that never terminates a line is bounded
-	// by the caller's request context.
-	bufferedFrames := 0
-	bufferedBytes := 0
 	var initialChunks [][]byte
 	streamStarted := false
 	immediateTerminal := false
@@ -219,7 +237,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if buffering {
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if budgetExhausted {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap %s exhausted after %d lines / %d bytes / %v, releasing stream without overload probing", exhaustedReason, bufferedFrames, bufferedBytes, nowCodexBootstrap().Sub(bootstrapStart))
+				initialChunks = nil
+				streamStarted = true
+				break
+			}
 			var translatedLine []byte
 			isHandshake := false
 			terminalSuccess := false
@@ -308,14 +331,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			if isHandshake && !terminalSuccess {
-				frameBytes := len(line)
+				rawLineCount := scanner.RawLines()
+				frameBytes := scanner.RawBytes()
 				for i := range chunks {
 					frameBytes += len(chunks[i])
 				}
 				timeSinceStart := nowCodexBootstrap().Sub(bootstrapStart)
 				timeoutReached := bootstrapTimeout > 0 && timeSinceStart >= bootstrapTimeout
-				if !timeoutReached && bufferedFrames < codexBootstrapMaxBufferedFrames && bufferedBytes+frameBytes <= codexBootstrapMaxBufferedBytes {
-					bufferedFrames++
+				totalFrames := bufferedFrames + scanner.HeldLines() + rawLineCount
+				totalBytes := bufferedBytes + scanner.HeldBytes() + frameBytes
+				if !timeoutReached && totalFrames <= codexBootstrapMaxBufferedFrames && totalBytes <= codexBootstrapMaxBufferedBytes {
+					bufferedFrames += rawLineCount
 					bufferedBytes += frameBytes
 					bufferedChunks = append(bufferedChunks, chunks...)
 					continue
@@ -323,7 +349,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				exhausted := "frame budget"
 				if timeoutReached {
 					exhausted = "time budget"
-				} else if bufferedFrames < codexBootstrapMaxBufferedFrames {
+				} else if totalFrames > codexBootstrapMaxBufferedFrames {
+					exhausted = "frame budget"
+				} else {
 					exhausted = "byte budget"
 				}
 				helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap %s exhausted after %d lines / %d bytes / %v, releasing stream without overload probing", exhausted, bufferedFrames, bufferedBytes, timeSinceStart)
@@ -336,6 +364,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			break
 		}
+		scanner.SetBudgetChecker(nil)
 
 		if !streamStarted && bootstrapTerminalErr == nil {
 			closeBootstrapBody()
@@ -422,7 +451,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		defer close(out)
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			var translatedLine []byte
 			terminalSuccess := false
 

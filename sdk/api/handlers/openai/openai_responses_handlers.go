@@ -147,8 +147,8 @@ func (f *responsesSSEFramer) shouldFilterPrivateEvent(streamEvent, payloadType s
 			return false
 		}
 
-		// Always filter internal WebSocket timing telemetry from SSE streams.
-		if strings.HasPrefix(name, "responsesapi.") {
+		// Always filter internal WebSocket timing telemetry and Meta subscription usage from SSE streams.
+		if strings.HasPrefix(name, "responsesapi.") || name == "response.subscription_usage" {
 			return true
 		}
 
@@ -245,8 +245,11 @@ func (f *responsesSSEFramer) repairErrorPayload(payload []byte) []byte {
 	errMsg := responsesSSEPayloadErrorMessage(payload)
 	status := errMsg.StatusCode
 	f.terminalError = errMsg
+	isResponseFailedPayload := gjson.GetBytes(payload, "type").String() == "response.failed"
 	failureEvent := f.failureEvent
-	if failureEvent != "response.failed" {
+	if isResponseFailedPayload || failureEvent == "response.failed" {
+		failureEvent = "response.failed"
+	} else {
 		failureEvent = "error"
 	}
 	f.terminalEvent = failureEvent
@@ -261,6 +264,19 @@ func (f *responsesSSEFramer) repairErrorPayload(payload []byte) []byte {
 	}
 	if failureEvent == "response.failed" {
 		chunk := handlers.BuildOpenAIResponsesStreamFailedChunk(status, errText, seq)
+		if isResponseFailedPayload && gjson.GetBytes(payload, "response").IsObject() {
+			repaired := f.repairCompletedPayload(payload)
+			respRaw := []byte(gjson.GetBytes(repaired, "response").Raw)
+			respRaw, _ = sjson.SetBytes(respRaw, "status", "failed")
+			if sanitizedErr := gjson.GetBytes(chunk, "response.error"); sanitizedErr.Exists() {
+				respRaw, _ = sjson.SetRawBytes(respRaw, "error", []byte(sanitizedErr.Raw))
+			}
+			env := []byte(`{"type":"response.failed","sequence_number":0,"response":{}}`)
+			env, _ = sjson.SetBytes(env, "sequence_number", seq)
+			if updated, errSet := sjson.SetRawBytes(env, "response", respRaw); errSet == nil {
+				chunk = updated
+			}
+		}
 		return []byte(fmt.Sprintf("event: response.failed\ndata: %s\n\n", chunk))
 	}
 	chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, seq)
@@ -551,7 +567,11 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 }
 
 func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context, payload []byte) []byte {
-	if h == nil || h.Cfg == nil {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil {
 		return payload
 	}
 
@@ -570,7 +590,7 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context
 		requestCtx,
 		requestHeaders,
 		payload,
-		h.Cfg.Client.Codex.OptimizeMultiAgentV2,
+		cfg.Client.Codex.OptimizeMultiAgentV2,
 		homeEnabled,
 	)
 	if prepared && c != nil {
@@ -580,7 +600,11 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context
 }
 
 func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegation(c *gin.Context, payload []byte) []byte {
-	if h == nil || h.Cfg == nil || !h.Cfg.CodexOrphanDelegationCompatibility {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.CodexOrphanDelegationCompatibility {
 		return payload
 	}
 	requestCtx := context.Background()
@@ -754,7 +778,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		}
 		return true
 	}
-	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.Cfg)
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
 	defer stopKeepAlive()
 
 	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(

@@ -97,8 +97,10 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
 					out, _ = sjson.DeleteBytes(out, "output_config.effort")
 				default:
-					if mapped, ok := thinking.MapToClaudeEffort(effort, supportsMax); ok {
-						effort = mapped
+					if !thinking.HasLevel(mi.Thinking.Levels, effort) {
+						if mapped, ok := thinking.MapToClaudeEffort(effort, supportsMax); ok {
+							effort = mapped
+						}
 					}
 					out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
 					out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
@@ -330,8 +332,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	emittedToolResults := map[string]struct{}{}
 	emittedRawToolUses := map[string]struct{}{}
 	unmappedItemTypes := map[string]int{}
+	webSearchHistory := scanResponsesWebSearchHistory(inputItems)
 
-	for _, item := range inputItems {
+	for itemIndex, item := range inputItems {
 		// System-level items already became top-level system blocks.
 		if isResponsesSystemLevelRole(item.Get("role").String()) {
 			continue
@@ -477,7 +480,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		case "web_search_call":
 			// Rebuild the Claude server-side search pair so the replayed turn
 			// still shows the search and its hits.
-			if blocks := convertResponsesWebSearchCallToClaudeBlocks(item); len(blocks) > 0 {
+			if blocks := webSearchHistory.claudeBlocks(itemIndex, item); len(blocks) > 0 {
 				appendParts("assistant", blocks...)
 			}
 
@@ -529,12 +532,13 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 				emittedToolResults[rawID] = struct{}{}
 			}
-			output := item.Get("output")
+			outputItem := item
 			if rawID != "" {
 				if lastItem, exists := lastToolResult[rawID]; exists {
-					output = lastItem.Get("output")
+					outputItem = lastItem
 				}
 			}
+			output := outputItem.Get("output")
 			// Standalone outputs (no call_id, or one that never paired with a
 			// function_call in this input, e.g. the create_thread delegation seed)
 			// have no tool_use to attach to. Claude rejects orphan tool_result
@@ -548,6 +552,12 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			callID := util.SanitizeClaudeToolID(rawID)
 			toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 			toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
+			// Responses reports an unfinished tool output as status
+			// "incomplete"; Claude's only in-band equivalent is is_error
+			// on tool_result, so carry the signal over instead of dropping it.
+			if strings.EqualFold(strings.TrimSpace(outputItem.Get("status").String()), "incomplete") {
+				toolResult, _ = sjson.SetBytes(toolResult, "is_error", true)
+			}
 			toolResult = applyResponsesToolResultContent(toolResult, output)
 
 			appendParts("user", toolResult)
@@ -635,6 +645,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// one winner for each final name, while keeping the original order for the
 	// tools that survive conversion.
 	var toolItems [][]byte
+	// The deferred anchor goes between declared and discovered tools, so each
+	// discovery only appends to tools[].
+	anchorIndex := -1
 	for _, descriptor := range responsesToolDescriptors(root, toolSearch) {
 		winner, ok := winners[descriptor.name]
 		if !ok || winner.order != descriptor.order {
@@ -646,6 +659,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			continue
 		}
 		if nativeToolSearch && descriptor.sourcePriority == responsesDiscoveredToolPriority {
+			if anchorIndex < 0 {
+				anchorIndex = len(toolItems)
+			}
 			// Anthropic rejects cache_control on deferred tools.
 			tJSON, _ = sjson.DeleteBytes(tJSON, "cache_control")
 			tJSON, _ = sjson.SetBytes(tJSON, "defer_loading", true)
@@ -657,12 +673,22 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 		toolItems = append(toolItems, tJSON)
 	}
+	if nativeToolSearch {
+		if anchorIndex < 0 {
+			anchorIndex = len(toolItems)
+		}
+		if anchor, ok := responsesDeferredAnchorTool(toolItems); ok {
+			toolItems = append(toolItems[:anchorIndex], append([][]byte{anchor}, toolItems[anchorIndex:]...)...)
+		}
+	}
 	toolNameMap = responsesToolNameMap(root, includedToolNames, toolSearch)
 	if len(toolItems) > 0 {
 		out, _ = sjson.SetRawBytes(out, "tools", common.JoinRawArray(toolItems))
 	}
 
 	// Map tool_choice similar to Chat Completions translator (optional in docs, safe to handle)
+	toolChoiceNone := false
+	forcedToolFilteredOut := false
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		switch toolChoice.Type {
 		case gjson.String:
@@ -671,14 +697,19 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 			case "none":
 				// Leave unset; implies no tools
+				toolChoiceNone = true
 			case "required":
 				if len(includedToolNames) > 0 {
 					out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"any"}`))
+				} else {
+					forcedToolFilteredOut = true
 				}
 			}
 		case gjson.JSON:
-			choiceType := toolChoice.Get("type").String()
-			if choiceType == "function" || choiceType == "custom" {
+			choiceType := strings.TrimSpace(toolChoice.Get("type").String())
+			if choiceType == "none" {
+				toolChoiceNone = true
+			} else if choiceType == "function" || choiceType == "custom" {
 				fn := toolChoice.Get("function.name").String()
 				if fn == "" {
 					fn = toolChoice.Get("custom.name").String()
@@ -703,10 +734,30 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					toolChoiceJSON := []byte(`{"name":"","type":"tool"}`)
 					toolChoiceJSON, _ = sjson.SetBytes(toolChoiceJSON, "name", names.claudeName(fn))
 					out, _ = sjson.SetRawBytes(out, "tool_choice", toolChoiceJSON)
+				} else {
+					forcedToolFilteredOut = true
+				}
+			} else if choiceType != "" && choiceType != "auto" {
+				if _, ok := includedToolNames[choiceType]; !ok {
+					forcedToolFilteredOut = true
 				}
 			}
 		default:
 
+		}
+	}
+
+	// parallel_tool_calls=false maps to Anthropic's disable_parallel_tool_use,
+	// mirroring the Chat Completions translator. It is not added when the
+	// effective choice is none, when no tool survived conversion, or when a
+	// forced tool was filtered out (no tool_choice was produced for it).
+	if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Type == gjson.False && !toolChoiceNone && !forcedToolFilteredOut && len(toolItems) > 0 {
+		if choice := gjson.GetBytes(out, "tool_choice"); choice.Exists() {
+			if choice.Get("type").String() != "none" {
+				out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
+			}
+		} else {
+			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto","disable_parallel_tool_use":true}`))
 		}
 	}
 
@@ -746,7 +797,9 @@ func isResponsesSystemLevelRole(role string) bool {
 
 // dropUnsupportedClaudeAssistantPrefill removes a trailing assistant message for
 // Claude model families that reject assistant message prefill (e.g., Fable,
-// Opus 5, Sonnet 4.6).
+// Opus 5, Sonnet 4.6, Haiku 5.5), except when the message ends on a server-tool
+// block (server_tool_use or web_search_tool_result) from a pause_turn response
+// that the continuation must send back.
 func dropUnsupportedClaudeAssistantPrefill(modelName string, messages [][]byte) [][]byte {
 	if !claudeModelRejectsAssistantPrefill(modelName) || len(messages) == 0 {
 		return messages
@@ -755,7 +808,27 @@ func dropUnsupportedClaudeAssistantPrefill(modelName string, messages [][]byte) 
 	if !strings.EqualFold(strings.TrimSpace(last.Get("role").String()), "assistant") {
 		return messages
 	}
+	if claudeAssistantMessageEndsWithPausedServerTool(last) {
+		return messages
+	}
 	return messages[:len(messages)-1]
+}
+
+func claudeAssistantMessageEndsWithPausedServerTool(message gjson.Result) bool {
+	content := message.Get("content")
+	if !content.IsArray() {
+		return false
+	}
+	parts := content.Array()
+	if len(parts) == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(parts[len(parts)-1].Get("type").String())) {
+	case "server_tool_use", "web_search_tool_result":
+		return true
+	default:
+		return false
+	}
 }
 
 // stripTrailingClaudeThinkingBlocks removes trailing thinking and
@@ -823,7 +896,7 @@ func claudeModelRejectsAssistantPrefill(modelName string) bool {
 	if tokens[0] == "fable" {
 		return true
 	}
-	if len(tokens) < 2 || (tokens[0] != "opus" && tokens[0] != "sonnet") {
+	if len(tokens) < 2 || (tokens[0] != "opus" && tokens[0] != "sonnet" && tokens[0] != "haiku") {
 		return false
 	}
 	parseVersion := func(token string) int {
