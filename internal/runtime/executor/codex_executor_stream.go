@@ -224,7 +224,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	//
 	// Never before the client is released. This runs after close(out), on a
 	// goroutine nobody waits on, so it costs the request nothing.
-	drainAfterTerminal := func(scanner *bufio.Scanner) {
+	drainAfterTerminal := func(scanner *helps.CodexSSEScanner) {
 		timer := time.AfterFunc(codexTerminalDrainBudget, func() {
 			_ = httpResp.Body.Close()
 		})
