@@ -57,12 +57,12 @@ func TestMetaExecutorTTFT(t *testing.T) {
 		{
 			name:     "done_reasoning_empty",
 			event:    `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[{"type":"summary_text","text":""}],"content":[]}}` + "\n\n",
-			wantTTFT: 1100 * time.Millisecond,
+			wantTTFT: 100 * time.Millisecond,
 		},
 		{
 			name:     "done_reasoning_encrypted_only",
 			event:    `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}` + "\n\n",
-			wantTTFT: 1100 * time.Millisecond,
+			wantTTFT: 100 * time.Millisecond,
 		},
 		{name: "function_arguments", event: "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"query\\\":\\\"hello\\\"}\"}\n\n", content: "query"},
 		{name: "chat_downstream", event: textDelta, content: "hello", format: sdktranslator.FormatOpenAI},
@@ -195,7 +195,9 @@ func TestMetaExecutorTTFT(t *testing.T) {
 			if tt.httpStatus != 0 {
 				wantLatency = 100 * time.Millisecond
 			}
-			if tt.nonstream || tt.readError != nil || tt.httpStatus != 0 {
+			// Tokenswim's shared token-event classifier does not count terminal
+			// status as observed output. Meta retains its first-packet fallback.
+			if tt.terminal || tt.nonstream || tt.readError != nil || tt.httpStatus != 0 {
 				wantTTFT = 100 * time.Millisecond
 			}
 			if tt.wantTTFT != 0 {
