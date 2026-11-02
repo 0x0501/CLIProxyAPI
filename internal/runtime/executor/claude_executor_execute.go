@@ -86,6 +86,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
+	body = helps.NormalizeClaudeToolChoice(e.upstreamRequestLogProvider(), upstreamModel, body)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -211,7 +212,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForUpstream := body
 	var oauthToolNamesReverseMap map[string]string
 	if fp.MCPAlias && cloaked {
-		mcpAliases := resolveClaudeMCPAliasOptions(ctx)
+		mcpAliases := resolveClaudeMCPAliasOptions(ctx, opts.Metadata, req.Metadata)
 		bodyForUpstream, oauthToolNamesReverseMap, err = e.prepareClaudeOAuthToolNamesForRequest(bodyForUpstream, mcpAliases)
 		if err != nil {
 			return resp, err
@@ -369,7 +370,14 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, msgID)
 		}
 		lines := bytes.Split(data, []byte("\n"))
+		var eventBuf bytes.Buffer
 		for i, line := range lines {
+			eventBuf.Write(line)
+			eventBuf.WriteByte('\n')
+			if len(bytes.TrimSpace(line)) == 0 {
+				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
+				eventBuf.Reset()
+			}
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveClaudeStream(line)
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
@@ -380,6 +388,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 				return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errRestore)
 			}
 			lines[i] = restoredLine
+		}
+		if eventBuf.Len() > 0 {
+			streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
+			eventBuf.Reset()
 		}
 		data = bytes.Join(lines, []byte("\n"))
 	} else {
@@ -419,12 +431,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
-	}
-	// Chat Completions has no failed-response object: Claude's
-	// model_context_window_exceeded becomes an HTTP 400 context_length_exceeded
-	// error, a request fault that is not retried on another credential.
-	if responseFormat == sdktranslator.FormatOpenAI && gjson.GetBytes(out, "error.code").String() == "context_length_exceeded" {
-		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: string(out)}
 	}
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil

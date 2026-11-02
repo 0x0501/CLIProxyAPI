@@ -251,34 +251,102 @@ func CanonicalToolName(name string) string {
 // ToolNameMapFromClaudeRequest returns a canonical-name -> original-name map extracted from a Claude request.
 // It is used to restore exact tool name casing for clients that require strict tool name matching (e.g. Claude Code).
 func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
+	return toolNameMapFromClaudeRequest(rawJSON, false)
+}
+
+// UnambiguousToolNameMapFromClaudeRequest precomputes the legacy Claude mapper's
+// collision policy so response chunks only need MapToolName, not the request body.
+// Ambiguous canonical keys are stored with an empty value, so the returned map is
+// only meaningful with MapToolName (which keeps the upstream name for empty
+// values); do not index it directly.
+func UnambiguousToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
+	return toolNameMapFromClaudeRequest(rawJSON, true)
+}
+
+func claudePayloadMayContainToolAddition(rawJSON []byte) bool {
+	return bytes.Contains(rawJSON, []byte("tool_addition")) ||
+		bytes.Contains(rawJSON, []byte(`\u`)) ||
+		bytes.Contains(rawJSON, []byte(`\U`))
+}
+
+func forEachClaudeInlineToolAdditionDefinition(rawJSON []byte, fn func(def gjson.Result)) {
+	if !claudePayloadMayContainToolAddition(rawJSON) {
+		return
+	}
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.IsArray() {
+		return
+	}
+	messages.ForEach(func(_, message gjson.Result) bool {
+		if message.Get("role").String() != "system" {
+			return true
+		}
+		content := message.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() != "tool_addition" {
+				return true
+			}
+			toolSpec := part.Get("tool")
+			if toolSpec.Get("type").String() == "tool_definition" || toolSpec.Get("definition").IsObject() {
+				if def := toolSpec.Get("definition"); def.IsObject() {
+					fn(def)
+				}
+			}
+			return true
+		})
+		return true
+	})
+}
+
+func toolNameMapFromClaudeRequest(rawJSON []byte, rejectAmbiguous bool) map[string]string {
 	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
 		return nil
 	}
 
 	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.Exists() || !tools.IsArray() {
+	hasTools := tools.Exists() && tools.IsArray()
+	hasToolAddition := claudePayloadMayContainToolAddition(rawJSON)
+	if !hasTools && !hasToolAddition {
 		return nil
 	}
 
-	toolResults := tools.Array()
-	out := make(map[string]string, len(toolResults))
-	tools.ForEach(func(_, tool gjson.Result) bool {
+	var out map[string]string
+	recordTool := func(tool gjson.Result) {
 		name := strings.TrimSpace(tool.Get("name").String())
 		if name == "" {
 			name = strings.TrimSpace(tool.Get("function.name").String())
 		}
 		if name == "" {
-			return true
+			return
 		}
 		key := CanonicalToolName(name)
 		if key == "" {
-			return true
+			return
 		}
-		if _, exists := out[key]; !exists {
+		if out == nil {
+			out = make(map[string]string, 4)
+		}
+		if previous, exists := out[key]; !exists {
 			out[key] = name
+		} else if rejectAmbiguous && previous != name {
+			// An empty value preserves the upstream name for every spelling of
+			// an ambiguous canonical key, including exact declared names.
+			out[key] = ""
 		}
-		return true
-	})
+	}
+
+	if hasTools {
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			recordTool(tool)
+			return true
+		})
+	}
+	if hasToolAddition {
+		forEachClaudeInlineToolAdditionDefinition(rawJSON, recordTool)
+	}
 
 	if len(out) == 0 {
 		return nil
@@ -298,6 +366,8 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 
 // MapClaudeToolName restores the client-facing tool name while preferring an exact
 // declared name over canonical (case/leading-underscore-insensitive) restoration.
+// It re-scans the request body on every call; hot paths should precompute with
+// UnambiguousToolNameMapFromClaudeRequest and use MapToolName instead.
 // This prevents distinct tools such as "Read" and "read" from being collapsed to
 // the first declaration when the upstream already returned an exact name.
 func MapClaudeToolName(toolNameMap map[string]string, originalRequestRawJSON []byte, name string) string {
@@ -306,19 +376,37 @@ func MapClaudeToolName(toolNameMap map[string]string, originalRequestRawJSON []b
 	}
 	if len(originalRequestRawJSON) > 0 && gjson.ValidBytes(originalRequestRawJSON) {
 		tools := gjson.GetBytes(originalRequestRawJSON, "tools")
-		if tools.IsArray() {
+		hasTools := tools.IsArray()
+		hasToolAddition := claudePayloadMayContainToolAddition(originalRequestRawJSON)
+		if hasTools || hasToolAddition {
 			canonical := CanonicalToolName(name)
 			canonicalNames := map[string]bool{}
-			for _, tool := range tools.Array() {
+			exactMatch := false
+			inspectTool := func(tool gjson.Result) {
 				declared := strings.TrimSpace(tool.Get("name").String())
 				if declared == "" {
 					declared = strings.TrimSpace(tool.Get("function.name").String())
 				}
 				if declared == name {
-					return name
+					exactMatch = true
+					return
 				}
 				if declared != "" && CanonicalToolName(declared) == canonical {
 					canonicalNames[declared] = true
+				}
+			}
+			if hasTools {
+				for _, tool := range tools.Array() {
+					inspectTool(tool)
+					if exactMatch {
+						return name
+					}
+				}
+			}
+			if hasToolAddition {
+				forEachClaudeInlineToolAdditionDefinition(originalRequestRawJSON, inspectTool)
+				if exactMatch {
+					return name
 				}
 			}
 			if len(canonicalNames) > 1 {
@@ -929,10 +1017,9 @@ func findClaudeToolSchema(originalRequestRawJSON []byte, toolName string) (gjson
 }
 
 // ClaudeToolIsParameterless reports whether the tool was declared in the original
-// Claude request with an empty or missing object schema. Such tools had a placeholder
-// "reason" property injected for Gemini/Antigravity schema validation, so any returned
-// arguments must be normalized to "{}" before they reach the Claude client. Schemas that
-// allow dynamic additional or pattern properties are never parameterless.
+// Claude request with a missing schema or an explicitly closed empty object schema
+// (additionalProperties: false). Schemas that allow dynamic additional or pattern
+// properties, including objects that omit additionalProperties, are not parameterless.
 func ClaudeToolIsParameterless(toolName string, originalRequestRawJSON []byte) bool {
 	schema, root, found := findClaudeToolSchema(originalRequestRawJSON, toolName)
 	if !found {
@@ -943,7 +1030,7 @@ func ClaudeToolIsParameterless(toolName string, originalRequestRawJSON []byte) b
 	}
 	_ = root
 	info := analyzeClaudeObjectSchema(schema, schema)
-	if info.complex || claudeInfoAnyBranchAllowsDynamic(info) || !info.declaresObject {
+	if info.complex || claudeInfoAnyBranchAllowsDynamic(info) || !info.declaresObject || !info.forbidsDynamic {
 		return false
 	}
 	return len(info.required) == 0 && (!info.hasProperties || len(info.properties) == 0)
@@ -1090,7 +1177,7 @@ func cleanClaudeToolObject(argsJSON string, schemas []gjson.Result, root gjson.R
 			break
 		}
 	}
-	if isEmptySchema && allSchemasDeclareObject && !claudeInfoAnyBranchAllowsDynamic(merged) && !claudeOriginalsAnyBranchAllowsDynamic(schemas, root) && !claudeOriginalsAnyCandidateAcceptsImplicitly(schemas, root, argsResult) {
+	if isEmptySchema && allSchemasDeclareObject && merged.forbidsDynamic && !claudeInfoAnyBranchAllowsDynamic(merged) && !claudeOriginalsAnyBranchAllowsDynamic(schemas, root) && !claudeOriginalsAnyCandidateAcceptsImplicitly(schemas, root, argsResult) {
 		if len(argsResult.Map()) == 0 {
 			return argsJSON
 		}
@@ -1643,12 +1730,11 @@ func cleanClaudeToolArgumentsByTranslatedSchema(argsJSON string, translatedSchem
 			cleaned, _ = sjson.Delete(cleaned, joinPath(path, placeholder))
 		}
 	}
-	// Parameterless tools: if the original declared no properties and no candidate
-	// schema (including alternative union branches that supplied this child) allows
-	// dynamic data, any remaining keys can only be injected placeholders; normalize
-	// to "{}". A free-form alternative candidate ("{}" or any candidate that does
-	// not declare an object at all) accepts arbitrary data, so the whole-object
-	// normalization must not run when one is present.
+	// Closed parameterless objects: if the original declared no properties and
+	// explicitly forbids additional properties (additionalProperties: false) without
+	// any candidate or union branch permitting dynamic data, normalize to "{}".
+	// Implicitly open objects (additionalProperties omitted) keep non-placeholder
+	// arguments after proven injected placeholders have been removed above.
 	allCandidatesDeclareObject := true
 	for _, original := range originals {
 		if !analyzeClaudeObjectSchema(original, root).declaresObject {
@@ -1660,7 +1746,7 @@ func cleanClaudeToolArgumentsByTranslatedSchema(argsJSON string, translatedSchem
 	if path != "" {
 		currentForNormalize = gjson.Get(cleaned, path)
 	}
-	if !originalInfo.complex && allCandidatesDeclareObject && !claudeInfoAnyBranchAllowsDynamic(originalInfo) && !claudeOriginalsAnyBranchAllowsDynamic(originals, root) && !claudeOriginalsAnyCandidateAcceptsImplicitly(originals, root, currentForNormalize) && originalInfo.declaresObject && len(originalInfo.required) == 0 && (!originalInfo.hasProperties || len(originalInfo.properties) == 0) {
+	if !originalInfo.complex && allCandidatesDeclareObject && originalInfo.forbidsDynamic && !claudeInfoAnyBranchAllowsDynamic(originalInfo) && !claudeOriginalsAnyBranchAllowsDynamic(originals, root) && !claudeOriginalsAnyCandidateAcceptsImplicitly(originals, root, currentForNormalize) && originalInfo.declaresObject && len(originalInfo.required) == 0 && (!originalInfo.hasProperties || len(originalInfo.properties) == 0) {
 		if topLevel {
 			return "{}"
 		}
@@ -1756,8 +1842,8 @@ func CleanClaudeToolArgumentsWithTranslated(rawArgs string, toolName string, ori
 
 // CleanClaudeToolArguments strips placeholder arguments ("reason" or "_") injected during
 // schema normalization for empty object schemas when returning responses to Claude clients.
-// If the tool was declared with empty or missing properties, the arguments are normalized
-// to "{}". Placeholder fields are also stripped recursively from declared nested object
+// If the tool was declared with empty or missing properties and additionalProperties: false,
+// the arguments are normalized to "{}". Placeholder fields are also stripped recursively from declared nested object
 // properties when they were not declared there. Free-form nested schemas that do not declare
 // an object type or properties are preserved because no placeholder is injected for them.
 // Tools that legitimately declared those fields or use union schemas that cannot be resolved
@@ -1787,7 +1873,7 @@ func CleanClaudeToolArguments(rawArgs string, toolName string, originalRequestRa
 	if info.complex || !info.declaresObject {
 		return rawArgs
 	}
-	if len(info.required) == 0 && (!info.hasProperties || len(info.properties) == 0) && !claudeInfoAnyBranchAllowsDynamic(info) {
+	if len(info.required) == 0 && (!info.hasProperties || len(info.properties) == 0) && info.forbidsDynamic && !claudeInfoAnyBranchAllowsDynamic(info) {
 		return "{}"
 	}
 	return cleanClaudeToolObject(rawArgs, []gjson.Result{schema}, schema, "", true)

@@ -4410,3 +4410,239 @@ func TestCleanJSONSchema_RemovesReadOnlyWriteOnlyKeywords_Issue6778(t *testing.T
 		})
 	}
 }
+
+// TestIssue6950_ArrayItemsFromAllOfPreserved verifies that array schemas whose items come from
+// allOf branches (directly, through a $ref, or alongside a base array $ref/branch) retain their
+// real items schema instead of having it replaced by Phase 0's {"type":"string"} placeholder.
+func TestIssue6950_ArrayItemsFromAllOfPreserved(t *testing.T) {
+	cleaners := map[string]struct {
+		clean             func(string) string
+		preservesNullable bool
+	}{
+		"Antigravity": {
+			clean:             CleanJSONSchemaForAntigravity,
+			preservesNullable: true,
+		},
+		"AntigravityTool": {
+			clean:             func(s string) string { return CleanJSONSchemaForAntigravityTool(s, false) },
+			preservesNullable: true,
+		},
+		"AntigravityClaudeTool": {
+			clean:             func(s string) string { return CleanJSONSchemaForAntigravityClaudeTool(s, false) },
+			preservesNullable: true,
+		},
+		"Gemini": {
+			clean:             CleanJSONSchemaForGemini,
+			preservesNullable: false,
+		},
+	}
+
+	cases := []struct {
+		name         string
+		input        string
+		path         string
+		wantItemType string
+		wantDesc     string
+		wantNullable bool
+	}{
+		{
+			name:         "direct_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "ref_in_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "nullable_type_array_with_ref_in_allof",
+			input:        `{"type":"object","properties":{"ids":{"type":["array","null"],"allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "(nullable)",
+			wantNullable: true,
+		},
+		{
+			name:         "split_allof_branches",
+			input:        `{"type":"object","properties":{"ids":{"allOf":[{"type":"array","description":"ID list"},{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "ref_base_array_with_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"$ref":"#/$defs/BaseArray","allOf":[{"items":{"type":"integer"}}]}},"$defs":{"BaseArray":{"type":"array","description":"ID list"}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "root_array_with_allof_items",
+			input:        `{"type":"array","allOf":[{"items":{"type":"integer"}}]}`,
+			path:         "",
+			wantItemType: "integer",
+		},
+		{
+			name:         "allof_without_items_gets_placeholder",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"description":"x"}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "string",
+			wantDesc:     "x",
+		},
+	}
+
+	for cleanerName, cleaner := range cleaners {
+		for _, tc := range cases {
+			t.Run(cleanerName+"/"+tc.name, func(t *testing.T) {
+				got := cleaner.clean(tc.input)
+				node := gjson.Parse(got)
+				if tc.path != "" {
+					node = node.Get(tc.path)
+				}
+				if gotType := node.Get("type").String(); gotType != "array" {
+					t.Errorf("type = %q, want \"array\": %s", gotType, got)
+				}
+				if gotItemType := node.Get("items.type").String(); gotItemType != tc.wantItemType {
+					t.Errorf("items.type = %q, want %q: %s", gotItemType, tc.wantItemType, got)
+				}
+				if tc.wantDesc != "" {
+					if gotDesc := node.Get("description").String(); gotDesc != tc.wantDesc {
+						t.Errorf("description = %q, want %q: %s", gotDesc, tc.wantDesc, got)
+					}
+				}
+				if tc.wantNullable && cleaner.preservesNullable {
+					if !node.Get("nullable").Bool() {
+						t.Errorf("nullable = false, want true: %s", got)
+					}
+				}
+				compareJSON(t, got, cleaner.clean(got))
+			})
+		}
+	}
+}
+
+func TestIssue7149_CleanJSONSchemaForGeminiJSONSchemaNormalizesNumericConstraintStrings(t *testing.T) {
+	input := `{
+		"type": "OBJECT",
+		"minProperties": "1",
+		"maxProperties": "8",
+		"$defs": {
+			"Tag": {
+				"type": "STRING",
+				"minLength": "2",
+				"maxLength": "16"
+			}
+		},
+		"properties": {
+			"Message": {
+				"type": "STRING",
+				"minLength": "1",
+				"maxLength": "100",
+				"enum": ["1", "2"],
+				"default": "1",
+				"example": "1",
+				"examples": ["1", {"minLength": "1"}]
+			},
+			"Items": {
+				"type": "ARRAY",
+				"minItems": "1",
+				"maxItems": "4",
+				"items": {
+					"$ref": "#/$defs/Tag"
+				}
+			},
+			"EqualRef": {
+				"$ref": "#/$defs/Tag",
+				"minLength": 2
+			}
+		}
+	}`
+
+	got := CleanJSONSchemaForGeminiJSONSchema(input)
+	parsed := gjson.Parse(got)
+
+	for _, tc := range []struct {
+		path string
+		want int64
+	}{
+		{"minProperties", 1},
+		{"maxProperties", 8},
+		{"properties.Message.minLength", 1},
+		{"properties.Message.maxLength", 100},
+		{"properties.Items.minItems", 1},
+		{"properties.Items.maxItems", 4},
+		{"properties.Items.items.minLength", 2},
+		{"properties.Items.items.maxLength", 16},
+		{"properties.EqualRef.minLength", 2},
+		{"properties.EqualRef.maxLength", 16},
+	} {
+		val := parsed.Get(tc.path)
+		if val.Type != gjson.Number || val.Int() != tc.want {
+			t.Errorf("%s = %s (type %v), want number %d; output=%s", tc.path, val.Raw, val.Type, tc.want, got)
+		}
+	}
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"properties.Message.enum.0", "1"},
+		{"properties.Message.enum.1", "2"},
+		{"properties.Message.default", "1"},
+		{"properties.Message.example", "1"},
+		{"properties.Message.examples.0", "1"},
+		{"properties.Message.examples.1.minLength", "1"},
+	} {
+		val := parsed.Get(tc.path)
+		if val.Type != gjson.String || val.String() != tc.want {
+			t.Errorf("%s = %s (type %v), want string %q; output=%s", tc.path, val.Raw, val.Type, tc.want, got)
+		}
+	}
+
+	extInput := `{"type":"string","minLength":"1","x-metadata":{"minLength":"2","maxItems":"3"},"customAnnotation":{"minProperties":"4"},"schema":{"minLength":"5"},"defs":{"metadata":{"minLength":"9"}},"properties":{"a\\b":{"type":"string","minLength":"6"},"a.b":{"type":"string","maxLength":"7"}},"patternProperties":{"^\\d+$":{"type":"string","minLength":"8"}}}`
+	extGot := NormalizeJSONSchemaNumericConstraints(extInput)
+	extParsed := gjson.Parse(extGot)
+	if got := extParsed.Get("minLength"); got.Type != gjson.Number || got.Int() != 1 {
+		t.Errorf("minLength = %s (type %v), want number 1; output=%s", got.Raw, got.Type, extGot)
+	}
+	if got := extParsed.Get("properties").Map()[`a\b`].Get("minLength"); got.Type != gjson.Number || got.Int() != 6 {
+		t.Errorf(`properties["a\\b"].minLength = %s (type %v), want number 6; output=%s`, got.Raw, got.Type, extGot)
+	}
+	if _, BogusExists := extParsed.Get("properties").Map()["ab"]; BogusExists {
+		t.Errorf(`unexpected fabricated property "ab" in output: %s`, extGot)
+	}
+	if got := extParsed.Get("properties").Map()["a.b"].Get("maxLength"); got.Type != gjson.Number || got.Int() != 7 {
+		t.Errorf(`properties["a.b"].maxLength = %s (type %v), want number 7; output=%s`, got.Raw, got.Type, extGot)
+	}
+	if got := extParsed.Get("patternProperties").Map()[`^\d+$`].Get("minLength"); got.Type != gjson.Number || got.Int() != 8 {
+		t.Errorf(`patternProperties["^\\d+$"].minLength = %s (type %v), want number 8; output=%s`, got.Raw, got.Type, extGot)
+	}
+	for _, path := range []struct {
+		path string
+		want string
+	}{
+		{"x-metadata.minLength", "2"},
+		{"x-metadata.maxItems", "3"},
+		{"customAnnotation.minProperties", "4"},
+		{"schema.minLength", "5"},
+		{"defs.metadata.minLength", "9"},
+	} {
+		got := extParsed.Get(path.path)
+		if got.Type != gjson.String || got.String() != path.want {
+			t.Errorf("%s = %s (type %v), want string %q; output=%s", path.path, got.Raw, got.Type, path.want, extGot)
+		}
+	}
+
+	unicodeEscapedInput := `{"type":"string","\u006dinLength":"1","\u0070roperties":{"Msg":{"type":"string","\u006daxLength":"2"}}}`
+	unicodeEscapedGot := NormalizeJSONSchemaNumericConstraints(unicodeEscapedInput)
+	unicodeParsed := gjson.Parse(unicodeEscapedGot)
+	if got := unicodeParsed.Get("minLength"); got.Type != gjson.Number || got.Int() != 1 {
+		t.Errorf("unicode-escaped minLength = %s (type %v), want number 1; output=%s", got.Raw, got.Type, unicodeEscapedGot)
+	}
+	if got := unicodeParsed.Get("properties.Msg.maxLength"); got.Type != gjson.Number || got.Int() != 2 {
+		t.Errorf("unicode-escaped properties.Msg.maxLength = %s (type %v), want number 2; output=%s", got.Raw, got.Type, unicodeEscapedGot)
+	}
+}

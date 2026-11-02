@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -60,6 +61,11 @@ func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatE
 
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *OpenAICompatExecutor) Identifier() string { return e.provider }
+
+// UsesConfig reports whether the executor is bound to the provided config snapshot.
+func (e *OpenAICompatExecutor) UsesConfig(cfg *config.Config) bool {
+	return e != nil && e.cfg == cfg
+}
 
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
 func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -164,10 +170,9 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(ctx, "openai compat executor", translated, true, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
 	}
-	reporter.SetTranslatedReasoningEffort(translated, to.String())
-
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -330,7 +335,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	}
 
 	reporter.ObserveResponseModel(body)
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
+	reporter.Publish(ctx, helps.ParseOpenAIImageUsage(payload, body, contentType))
 	reporter.EnsurePublished(ctx)
 	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
 	return resp, nil
@@ -398,10 +403,10 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
-	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -483,7 +488,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				loggedErr = statusErr{code: streamErr.code, msg: "upstream stream returned an error payload"}
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, loggedErr)
-			reporter.PublishFailure(ctx, loggedErr)
+			if !streamUsage.PublishFailure(ctx, reporter, loggedErr) {
+				reporter.PublishFailure(ctx, loggedErr)
+			}
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-ctx.Done():
@@ -533,6 +540,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			}
 
 			// Observe complete upstream frames before translation or downstream backpressure.
+			if !isDone && len(dataLines) > 1 {
+				streamUsage.ObserveOpenAIStream(dataPayload)
+			}
 			helps.ObserveChatTokenEvent(reporter, dataPayload)
 			streamLine := append([]byte("data: "), dataPayload...)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, streamLine, &param, claudeInputTokens)
@@ -612,7 +622,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		}
 		if errScan != nil && !seenDone {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			if !streamUsage.PublishFailure(ctx, reporter, errScan) {
+				reporter.PublishFailure(ctx, errScan)
+			}
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -621,7 +633,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			// Without a translator-confirmed terminal state, a clean Responses or Claude EOF
 			// without [DONE] remains a failed stream instead of completing it.
 			if responseFormat == sdktranslator.FormatOpenAIResponse || (responseFormat == sdktranslator.FormatClaude && !sawFinishReason) {
-				streamErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before [DONE]"}
+				streamErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before [DONE]", streamTruncated: true}
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 				if !helps.RecordApplyPatchStreamFailureWithUsage(ctx, param, reporter, &streamUsage, streamErr) {
 					if !streamUsage.PublishFailure(ctx, reporter, streamErr) {
@@ -740,12 +752,17 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		var streamUsage helps.StreamUsageBuffer
+		streamUsage.SetRequestPayload(payload, contentType)
+		usageObserver := helps.NewOpenAIStreamUsageObserver(&streamUsage, streamScannerBuffer)
 		observer := helps.NewStreamResponseModelObserver(reporter)
 		defer func() {
 			observer.Finish()
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("openai compat executor: close response body error: %v", errClose)
 			}
+			usageObserver.Finish()
+			streamUsage.Publish(ctx, reporter)
 			reporter.EnsurePublished(ctx)
 		}()
 		buffer := make([]byte, 32*1024)
@@ -755,6 +772,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 				chunk := bytes.Clone(buffer[:n])
 				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
 				observer.Feed(chunk)
+				usageObserver.Feed(chunk)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
 				case <-ctx.Done():
@@ -764,7 +782,11 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			if errRead != nil {
 				if errRead != io.EOF {
 					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-					reporter.PublishFailure(ctx, errRead)
+					observer.Finish()
+					usageObserver.Finish()
+					if !streamUsage.PublishFailure(ctx, reporter, errRead) {
+						reporter.PublishFailure(ctx, errRead)
+					}
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
 					case <-ctx.Done():
@@ -1152,10 +1174,14 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 }
 
 type statusErr struct {
-	code             int
-	msg              string
-	retryAfter       *time.Duration
-	credentialScoped bool
+	code               int
+	msg                string
+	retryAfter         *time.Duration
+	credentialScoped   bool
+	streamTruncated    bool
+	transientRateLimit bool
+	// diagnostic is a content-free detail for logs only; it never reaches clients.
+	diagnostic string
 }
 
 func (e statusErr) Error() string {
@@ -1167,6 +1193,17 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
+
+// LogDiagnostic lets upstream failure logs explain a sanitized client message.
+func (e statusErr) LogDiagnostic() string { return e.diagnostic }
+
+// IsStreamTruncated marks a locally synthesized failure for an accepted
+// upstream stream that ended without its terminal frame.
+func (e statusErr) IsStreamTruncated() bool { return e.streamTruncated }
+
+// IsTransientRateLimit marks a transient per-model capacity/admission 429
+// that must not be recorded as credential quota exhaustion.
+func (e statusErr) IsTransientRateLimit() bool { return e.transientRateLimit }
 
 const openAICompatTPMFallbackRetryAfter = time.Minute
 
@@ -1182,22 +1219,45 @@ func newOpenAICompatStatusError(status int, headers http.Header, body []byte) st
 // Some OpenAI-compatible providers omit that header for explicit per-minute
 // token limits; in that narrow case a one-minute fallback prevents immediate
 // replay of the same large request while keeping the retry wait bounded.
+// parseRetryAfterHeader parses an HTTP Retry-After header in either the
+// delay-seconds or HTTP-date form. A present, valid value always yields a
+// non-nil result so that an explicit immediate retry (0 seconds or a past
+// date) stays distinguishable from an absent hint; missing or malformed
+// values yield nil and let body-derived hints apply.
+func parseRetryAfterHeader(headers http.Header, now time.Time) *time.Duration {
+	if headers == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	if seconds, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil && seconds >= 0 {
+		if seconds > int64(math.MaxInt64)/int64(time.Second) {
+			// Out of representable range: clamp to the largest duration so
+			// far-future deadlines only ever over-report recovery.
+			delay := time.Duration(math.MaxInt64)
+			return &delay
+		}
+		delay := time.Duration(seconds) * time.Second
+		return &delay
+	}
+	if deadline, errParse := http.ParseTime(raw); errParse == nil {
+		delay := deadline.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		return &delay
+	}
+	return nil
+}
+
 func openAICompatRetryAfter(status int, headers http.Header, body []byte, now time.Time) *time.Duration {
 	if status != http.StatusTooManyRequests {
 		return nil
 	}
-	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
-		if seconds, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil && seconds >= 0 {
-			delay := time.Duration(seconds) * time.Second
-			return &delay
-		}
-		if deadline, errParse := http.ParseTime(raw); errParse == nil {
-			delay := deadline.Sub(now)
-			if delay < 0 {
-				delay = 0
-			}
-			return &delay
-		}
+	if retryAfter := parseRetryAfterHeader(headers, now); retryAfter != nil {
+		return retryAfter
 	}
 
 	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
