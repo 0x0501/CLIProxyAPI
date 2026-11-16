@@ -124,3 +124,29 @@ func TestClassifyRefreshErrorDeadGrantIsRevoked(t *testing.T) {
 		t.Fatalf("5xx refresh must be transient, got %s", transient.Disposition)
 	}
 }
+
+func TestClassifyRefreshErrorRejectedReceiptIsRevoked(t *testing.T) {
+	for _, code := range []string{
+		"refresh_token_reused",
+		"refresh_token_expired",
+		"refresh_token_invalidated",
+		"token_revoked",
+		"invalid_grant",
+		"invalid_client",
+		"401 unauthorized",
+	} {
+		t.Run(code, func(t *testing.T) {
+			result := ClassifyRefreshError(errors.New("token refresh rejected: " + code))
+			if result.Disposition != DispositionRevoked || result.HTTPStatus() != 403 {
+				t.Fatalf("rejected receipt must revoke the grant, got %+v", result)
+			}
+		})
+	}
+}
+
+func TestClassifyRefreshErrorUnknownOutcomeRemainsTransient(t *testing.T) {
+	result := ClassifyRefreshError(errors.New("refresh_outcome_unknown: response-read; reconcile the refresh result or sign in again"))
+	if result.Disposition != DispositionUpstreamError || result.HTTPStatus() != 502 {
+		t.Fatalf("unknown refresh outcome must remain transient, got %+v", result)
+	}
+}

@@ -1,11 +1,11 @@
 package gateway
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -72,7 +72,7 @@ func ClassifyExecError(err error) ErrorPayload {
 	return ErrorPayload{
 		Disposition:    Classify(status, body),
 		UpstreamStatus: status,
-		Code:           gjson.Get(body, "error.code").String(),
+		Code:           ojson.Get(body, "error.code").String(),
 		Message:        truncate(body, 2000),
 	}
 }
@@ -85,6 +85,7 @@ func ClassifyRefreshError(err error) ErrorPayload {
 	s := strings.ToLower(err.Error())
 	permanent := strings.Contains(s, "invalid_grant") ||
 		strings.Contains(s, "refresh_token_reused") ||
+		strings.Contains(s, "token refresh rejected:") ||
 		strings.Contains(s, "status 400") ||
 		strings.Contains(s, "status 401")
 	d := DispositionUpstreamError

@@ -5,8 +5,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 // codexClaudeChunks runs the REAL codex->claude response translator over a canned
@@ -48,7 +48,7 @@ func claudeDataPayload(chunks [][]byte, typ string) []byte {
 				continue
 			}
 			j := bytes.TrimSpace(t[len("data:"):])
-			if gjson.GetBytes(j, "type").String() == typ {
+			if ojson.GetBytes(j, "type").String() == typ {
 				return j
 			}
 		}

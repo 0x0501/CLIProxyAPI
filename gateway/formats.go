@@ -3,9 +3,9 @@ package gateway
 import (
 	"bytes"
 
+	"github.com/MoeForge/moego/ojson"
 	// Registers all codex<->openai request/response (stream+non-stream) translators.
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
-	"github.com/tidwall/gjson"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -59,7 +59,7 @@ func codexUsage(raw []byte) (usage.Detail, bool) {
 var codexStyle = FormatProfile{
 	Extract:      stripData,
 	Frame:        func(b []byte) []byte { return b },
-	IsTerminal:   func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "response.completed" },
+	IsTerminal:   func(raw []byte) bool { return ojson.GetBytes(raw, "type").String() == "response.completed" },
 	ParseUsage:   codexUsage,
 	AtomicChunks: false,
 	AppendDone:   false,
@@ -70,7 +70,7 @@ var codexStyle = FormatProfile{
 var openaiStyle = FormatProfile{
 	Extract:    func(b []byte) []byte { return b },
 	Frame:      func(b []byte) []byte { return append([]byte("data: "), b...) },
-	IsTerminal: func(raw []byte) bool { return gjson.GetBytes(raw, "usage").Exists() },
+	IsTerminal: func(raw []byte) bool { return ojson.GetBytes(raw, "usage").Exists() },
 	ParseUsage: func(raw []byte) (usage.Detail, bool) {
 		d := helps.ParseOpenAIUsage(raw)
 		return d, d.TotalTokens > 0
@@ -100,7 +100,7 @@ func extractClaudeEvent(b []byte) []byte {
 		if first == nil {
 			first = j
 		}
-		if gjson.GetBytes(j, "type").String() == "message_delta" {
+		if ojson.GetBytes(j, "type").String() == "message_delta" {
 			return j
 		}
 	}
@@ -115,7 +115,7 @@ func extractClaudeEvent(b []byte) []byte {
 var claudeStyle = FormatProfile{
 	Extract:    extractClaudeEvent,
 	Frame:      func(b []byte) []byte { return b },
-	IsTerminal: func(raw []byte) bool { return gjson.GetBytes(raw, "type").String() == "message_delta" },
+	IsTerminal: func(raw []byte) bool { return ojson.GetBytes(raw, "type").String() == "message_delta" },
 	ParseUsage: func(raw []byte) (usage.Detail, bool) {
 		d := helps.ParseClaudeUsage(raw)
 		return d, usageHasTokens(d)

@@ -1,10 +1,11 @@
 package gateway
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/MoeForge/moego/json"
 )
 
 func TestModelsHandlerReturnsOpenAIList(t *testing.T) {

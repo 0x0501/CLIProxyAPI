@@ -1,18 +1,18 @@
 package gateway
 
 import (
-	"encoding/json"
 	"net/http"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 // requestWantsStream reports whether the client request body asked for SSE streaming.
 func requestWantsStream(payload []byte) bool {
-	return gjson.GetBytes(payload, "stream").Bool()
+	return ojson.GetBytes(payload, "stream").Bool()
 }
 
 func Handler(cfg *config.Config) http.HandlerFunc {

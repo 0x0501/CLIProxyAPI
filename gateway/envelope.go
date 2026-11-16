@@ -1,9 +1,10 @@
 package gateway
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
+
+	"github.com/MoeForge/moego/json"
 )
 
 // Envelope is the worker->gateway request body: an opaque credential map dropped

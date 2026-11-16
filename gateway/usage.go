@@ -1,8 +1,7 @@
 package gateway
 
 import (
-	"encoding/json"
-
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 

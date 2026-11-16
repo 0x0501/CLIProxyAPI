@@ -1,10 +1,10 @@
 package gateway
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
