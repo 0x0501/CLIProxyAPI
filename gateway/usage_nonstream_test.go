@@ -71,7 +71,7 @@ func nonStreamUsageHeader(t *testing.T, exec *fakeExecutor) (UsagePayload, bool)
 	registerFakeProvider(t, exec)
 	body := `{"provider":"fake","format":"claude","credential":{"access_token":"a"},"request":{"model":"` + fixtureModel + `"}}`
 	rec := httptest.NewRecorder()
-	Handler(&config.Config{})(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	Handler(&config.Config{}, nil)(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("handler returned %d: %s", rec.Code, rec.Body.String())
 	}

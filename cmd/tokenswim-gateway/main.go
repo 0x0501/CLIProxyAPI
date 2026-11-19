@@ -25,9 +25,10 @@ const gatewayProtocol = 1
 
 // newMux wires the gateway routes. Split out of main so the /healthz handshake
 // can be tested without binding a port.
-func newMux(cfg *config.Config) *http.ServeMux {
+func newMux(cfg *config.Config, sessions *gateway.UpstreamSessions) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/invoke", gateway.Handler(cfg))
+	mux.HandleFunc("/invoke", gateway.Handler(cfg, sessions))
+	mux.HandleFunc("/session/close", gateway.CloseHandler(sessions))
 	mux.HandleFunc("/usage", gateway.UsageHandler(cfg))
 	mux.HandleFunc("/models", gateway.ModelsHandler)
 	mux.HandleFunc("/healthz", healthz)
@@ -59,7 +60,9 @@ func main() {
 		log.Printf("tokenswim-gateway: upstream proxy %s", proxyutil.Redact(proxyURL))
 	}
 	executor.StartXAIVersionUpdater(context.Background(), cfg.ProxyURL)
-	mux := newMux(cfg)
+	sessions := gateway.NewUpstreamSessions(cfg)
+	go sessions.Run(context.Background())
+	mux := newMux(cfg, sessions)
 
 	addr := ":8787"
 	log.Printf("tokenswim-gateway listening on %s", addr)

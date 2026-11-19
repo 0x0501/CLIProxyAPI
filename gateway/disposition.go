@@ -19,6 +19,10 @@ const (
 	DispositionExpired       Disposition = "expired"
 	DispositionRateLimited   Disposition = "rate_limited"
 	DispositionUpstreamError Disposition = "upstream_error"
+	// DispositionSessionLost: a continuation found no live upstream socket (or
+	// the upstream no longer holds previous_response_id). Not a credential
+	// signal; the caller resends the full input.
+	DispositionSessionLost Disposition = "session_lost"
 )
 
 type ErrorPayload struct {
@@ -69,10 +73,17 @@ func StatusFromExecErr(err error) (int, string) {
 
 func ClassifyExecError(err error) ErrorPayload {
 	status, body := StatusFromExecErr(err)
+	code := ojson.Get(body, "error.code").String()
+	disposition := Classify(status, body)
+	if cliproxyexecutor.IsUpstreamWebsocketReplayRequired(err) ||
+		code == "previous_response_not_found" ||
+		code == "websocket_connection_limit_reached" {
+		disposition = DispositionSessionLost
+	}
 	return ErrorPayload{
-		Disposition:    Classify(status, body),
+		Disposition:    disposition,
 		UpstreamStatus: status,
-		Code:           ojson.Get(body, "error.code").String(),
+		Code:           code,
 		Message:        truncate(body, 2000),
 	}
 }
@@ -109,6 +120,8 @@ func (p ErrorPayload) HTTPStatus() int {
 		return 403
 	case DispositionRateLimited:
 		return 429
+	case DispositionSessionLost:
+		return 409
 	default:
 		return 502
 	}

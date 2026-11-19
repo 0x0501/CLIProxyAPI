@@ -7,6 +7,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/gateway"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
@@ -16,7 +17,7 @@ import (
 // treated as unhealthy, so this response is a wire contract, not a nicety.
 func TestHealthzAnswersProtocol1Handshake(t *testing.T) {
 	rec := httptest.NewRecorder()
-	newMux(&config.Config{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	newMux(&config.Config{}, gateway.NewUpstreamSessions(&config.Config{})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -39,7 +40,7 @@ func TestHealthzAnswersProtocol1Handshake(t *testing.T) {
 
 func TestHealthzAnswersHead(t *testing.T) {
 	rec := httptest.NewRecorder()
-	newMux(&config.Config{}).ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/healthz", nil))
+	newMux(&config.Config{}, gateway.NewUpstreamSessions(&config.Config{})).ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/healthz", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)

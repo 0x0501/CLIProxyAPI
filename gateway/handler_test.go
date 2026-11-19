@@ -16,7 +16,7 @@ import (
 func TestHandlerRejectsBadEnvelope(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
-	Handler(&config.Config{})(rec, req)
+	Handler(&config.Config{}, nil)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", rec.Code)
 	}
@@ -25,7 +25,7 @@ func TestHandlerRejectsBadEnvelope(t *testing.T) {
 func TestHandlerRejectsUnknownProvider(t *testing.T) {
 	rec := httptest.NewRecorder()
 	body := `{"provider":"nope","credential":{"access_token":"a"},"request":{"model":"m"}}`
-	Handler(&config.Config{})(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	Handler(&config.Config{}, nil)(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400 for unknown provider, got %d", rec.Code)
 	}
