@@ -481,7 +481,8 @@ func normalizeCodexParametersDoc(doc *ojson.Doc, paramsPath string, params ojson
 
 func stripIncompatiblePatternsFromJSON(rawStr string) (string, bool) {
 	if !strings.Contains(rawStr, `\p{`) && !strings.Contains(rawStr, `\P{`) && !strings.Contains(rawStr, `\u`) &&
-		!strings.Contains(rawStr, `\\0`) && !strings.Contains(rawStr, "inimum") && !strings.Contains(rawStr, "aximum") {
+		!strings.Contains(rawStr, `\\0`) && !strings.Contains(rawStr, "inimum") && !strings.Contains(rawStr, "aximum") &&
+		!(strings.Contains(rawStr, `"pattern"`) && strings.Contains(rawStr, "[")) {
 		return rawStr, false
 	}
 	var root any
@@ -596,9 +597,14 @@ func stripIncompatiblePatterns(v any) bool {
 	changed := false
 	switch schema := v.(type) {
 	case map[string]any:
-		if patternVal, ok := schema["pattern"].(string); ok && util.HasUnsupportedUnicodePropertyEscape(patternVal) {
-			delete(schema, "pattern")
-			changed = true
+		if patternVal, ok := schema["pattern"].(string); ok {
+			if util.HasUnsupportedUnicodePropertyEscape(patternVal) {
+				delete(schema, "pattern")
+				changed = true
+			} else if normalized := normalizeCodexPatternClassBrackets(patternVal); normalized != patternVal {
+				schema["pattern"] = normalized
+				changed = true
+			}
 		}
 		for _, boundKey := range codexNumericBoundKeywords {
 			if boundVal, ok := schema[boundKey].(json.Number); ok && isNumericBoundOutOfInt64(boundVal) {
